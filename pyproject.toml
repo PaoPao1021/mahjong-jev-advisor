@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mahjong-jev-advisor"
+version = "0.1.0"
+description = "Read-only Mahjong Soul screen advisor with TypeSafe Jev"
+requires-python = ">=3.12"
+dependencies = [
+  "PySide6>=6.8,<7",
+  "opencv-python-headless>=4.10,<5",
+  "numpy>=1.26,<3",
+  "mss>=10,<11",
+  "rapidocr-onnxruntime>=1.4,<2",
+  "mahjong>=1.2.1,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+mahjong-jev-advisor = "mahjong_jev_advisor.app:main"
+mahjong-jev-replay = "mahjong_jev_advisor.replay:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
