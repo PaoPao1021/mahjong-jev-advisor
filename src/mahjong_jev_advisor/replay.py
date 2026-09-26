@@ -5,10 +5,22 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 
 import cv2
+
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from .jev import advise
 from .rules import NoDecision, UncertainState, candidates, local_choice
@@ -93,8 +105,10 @@ def main() -> None:
                 row["problems"].append(str(error))
         row["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
         latencies.append(row["latency_ms"])
-        results.append(row)
-        print(json.dumps(row, ensure_ascii=False))
+        try:
+            print(json.dumps(row, ensure_ascii=False))
+        except UnicodeEncodeError:
+            print(json.dumps(row, ensure_ascii=True))
     if args.output:
         args.output.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in results) + "\n", encoding="utf-8")
     summary = {
@@ -105,7 +119,11 @@ def main() -> None:
         "button_exact_accuracy": recognized_button / total_button if total_button else None,
         "abstentions": sum("advice" not in row for row in results),
     }
-    print("SUMMARY " + json.dumps(summary, ensure_ascii=False))
+    summary_str = "SUMMARY " + json.dumps(summary, ensure_ascii=False)
+    try:
+        print(summary_str)
+    except UnicodeEncodeError:
+        print("SUMMARY " + json.dumps(summary, ensure_ascii=True))
 
 
 if __name__ == "__main__":
