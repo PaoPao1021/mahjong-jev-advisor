@@ -1,123 +1,103 @@
-# 雀魂 · Jev 实时切牌顾问 (Mahjong Jev Advisor)
+# 雀魂 · Jev 实时决策顾问
 
-[![CI](https://github.com/PaoPao1021/mahjong-jev-advisor/actions/workflows/ci.yml/badge.svg)](https://github.com/PaoPao1021/mahjong-jev-advisor/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python: 3.12+](https://img.shields.io/badge/Python-3.12+-emerald.svg)](https://www.python.org/)
+Python / PySide6 桌面程序，通过截屏、牌面模板和 OCR 重建公开状态，生成本地合法候选，再调用在线模型选择动作。程序不代替玩家操作。
 
-**雀魂 · Jev 实时切牌顾问** 是一款专为《雀魂》（Mahjong Soul）四人日本麻将打造的高密度赛博朋克深色毛玻璃 HUD 战术辅助工具。
+实时数据源优先使用随项目提供的只读浏览器 Hook：它在页面加载时接收雀魂 WebSocket 的 Protobuf 牌局事件，经本机 `127.0.0.1:8765` 内存解码后更新顾问。它不发送游戏操作，不保存原始网络帧。屏幕识别保留为 Hook 未连接时的备用方式。
 
-程序以**纯视觉只读方式（OCR / 模板匹配）**提取公开牌面状态，内置**全量日麻 60 役种打点推演引擎**与现代立直防御理论（现物/筋牌/壁牌/早巡外侧），在亚毫秒级完成合法候选动作剪枝与番数打点计算，并无缝接入 **TypeSafe Jev (`jev-latest`)** 决策模型与通用大模型（**DeepSeek / OpenAI / Claude / Qwen**）进行概率博弈与战术复盘。
+## 推荐：网页 Hook 实时监测
 
-> **免责声明**：本项目仅供麻将 AI 研究与算法学习交流使用。程序仅以截屏只读方式获取游戏公开画面，**绝不注入游戏进程、绝不修改游戏内存或发送任何网络作弊数据包**，严格遵守游戏公平竞技准则。
+1. 先启动桌面顾问；本机桥接服务只监听 `127.0.0.1:8765`。
+2. 在 Edge 地址栏打开 `edge://extensions`，开启“开发人员模式”。Chrome 使用 `chrome://extensions`。
+3. 点击“加载解压缩的扩展”，选择项目中的 `browser-extension` 文件夹。
+4. 已经加载过扩展时，先在扩展卡片上点一次“重新加载”；再完全刷新雀魂网页（Ctrl+R）。仅刷新网页不会更新扩展脚本。
+5. 顾问会依次显示“网页 Hook 已注入”“已截获雀魂 WebSocket”“已收到数据帧”“实时牌局已识别”。只有最后一项表示已取得手牌；端口连通或协议载入不会再被误判为牌局可用。
+6. 如果没有出现最后一项，打开【桌】→【查看网页 Hook 诊断】。诊断只显示计数、事件名和连接主机，不保存原始帧或账号信息。
 
----
+项目已内置雀魂 Unity WebGL 客户端对应的完整 `liqi.json`（支持 4.0+ 版本的 Protobuf 架构），扩展采用 Manifest V3 主执行环境（MAIN world）即时注入，适配 Unity WebGL 不再通过 HTTP 动态下载 `liqi.json` 的情况。扩展只匹配雀魂官方网页域名，帧只发往本机回环地址。Hook 尚未解出真实牌局时，程序不会停用已校准的屏幕识别备用通道。
 
-## 核心特性
+## 启动
 
-- **赛博朋克深色毛玻璃 HUD 界面**：
-  - 采用 Windows DWM 亚克力磨砂特效与深色高对比度玻璃拟物布局。
-  - 核心决策卡片：实时展示候选动作、向听数徽章、Jev 校准概率柱状图（支持 Top 4 选项概率分布与色条渲染）、防守弃和率、放铳危险分与次选切牌胶囊。
-  - 手牌与进张槽位：支持切牌发光高亮指示；支持**手牌交互式模拟切牌推演**（点击任意手牌立即模拟切牌向听数与进张）。
-  - 全局二级菜单沉浸同步：大模型设置、Jev 设置、手动牌面核对、区域校准与大模型牌理推演均统一采用深色霓虹赛博朋克 UI。
+Windows 双击 `run_windows.cmd`；macOS 执行 `zsh run_macos.sh`。需要 Python 3.12+。已有虚拟环境时，启动脚本直接加载当前项目源码。
 
-- **Windows 10/11 零闪烁无感实时截屏**：
-  - 调用 `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` 将顾问悬浮窗从屏幕截图中隐形。
-  - 悬浮窗可直接叠加覆盖在游戏画面上方，截屏采集时**无需隐藏/闪烁窗口**，250ms 持续平滑后台监测。
+窗口使用系统标题栏，可拖动、缩放、最小化；较矮屏幕上的中间内容可滚动，底部按钮保持可见。首次升级默认不透明，避免文字与背景叠加；可用 Ctrl + 滚轮调整透明度。
 
-- **全量内置 60 役种与打点预演算力引擎**：
-  - 涵盖 1 翻至役满全部 60 种标准日麻役种（断幺九、平和、一盃口、役牌、混一色、清一色、七对子、对对和、一气通贯、三色同顺、国士无双等）。
-  - **听牌打点与番数估算**：严格区分赤宝牌（0m/0p/0s）与普通宝牌，实时计算听牌最小/最大番数、符数与期望点数。
-  - **片和与形式听牌（无役死手）自动拦截**：精准识别无役副露与形式听牌风险，防止盲目和牌导致振听或死手。
-  - **鸣牌安全性校验**：吃/碰/杠时自动校验役种支持，防止无役副露。
+### 使用前自检
 
-- **双 AI 算力架构**：
-  - **TypeSafe Jev (`jev-latest`)**：专为日麻打造的高性能选择模型（严格 0.9s 超时限制），提供精确的打牌概率分布与巡目攻守建议。
-  - **通用大语言模型（DeepSeek / OpenAI / Claude / Qwen）**：一键调用大模型进行局况深度牌理推演与战术复盘讲解。
-  - **本地确定性兜底**：断网或未配置 Key 时，亚毫秒级本地规则引擎无缝兜底输出雀圣级建议。
+Windows 双击 `check_windows.cmd`；macOS 执行 `zsh run_macos.sh --check`。检查 Python、依赖、OCR 模型、配置、校准、模板与屏幕采集。自检不保存截图、不显示 Key。输出 `ready: false` 时按各项提示补齐；不代表程序无法启动。
 
----
+也可以在项目目录执行：
 
-## 安装与快速启动
-
-### 系统要求
-- Python 3.12+
-- Windows 10 (2004+) / Windows 11 或 macOS (12.0+)
-- 浏览器打开《雀魂》网页版（建议 100% 页面缩放）
-
-### 一键脚本启动
-
-- **Windows 用户**：双击运行根目录下的 `run_windows.cmd`
-- **macOS 用户**：终端执行 `zsh run_macos.sh`
-
-脚本会在首次运行时代动创建虚拟环境、安装所有依赖并启动顾问面板。
-
-### 手动安装运行
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/PaoPao1021/mahjong-jev-advisor.git
-cd mahjong-jev-advisor
-
-# 2. 创建并激活虚拟环境
-python -m venv .venv
-# Windows:
-.\.venv\Scripts\activate
-# macOS:
-source .venv/bin/activate
-
-# 3. 安装依赖
-pip install -e .
-
-# 4. 运行顾问工具
-mahjong-jev-advisor
+```powershell
+.venv\Scripts\python.exe -m mahjong_jev_advisor.preflight --online --output readiness-report.json
 ```
 
----
+`--online` 会向当前保存地址发送一次真实推断，可能产生少量费用；不加时只检查本机。报告只包含诊断信息。可先填写 Key，用【手动核对】输入真实牌局验证在线建议，再准备屏幕模板。
 
-## 首次使用指南
+## 先验证模型连接
 
-1. **绑定牌桌**：
-   - 启动程序后，点击右上角【桌】→【选择牌桌画面】。
-   - 在弹出的全屏截图中拖动框选雀魂的游戏对局区域（16:9 完整牌桌）。
-   - 绑定成功后，程序将**自动启动后台 250ms 实时画面监测**。
+1. 打开底部【Jev设置】（在线模型连接设置）。
+2. 选择协议，填写完整 POST 请求地址、API Key 和模型名称。
+3. 点击【测试连接 · 真实请求】。该按钮通过与正式决策相同的后台请求与解析代码发送一次简短推断，可能产生少量费用。只有收到 HTTP 200 且答案可解析时显示成功。
+4. 保存配置。配置保存在本机用户目录，不写入仓库。
 
-2. **校准区域（可选与扩展）**：
-   - 点击右上角【桌】→【基础校准】，依次确认手牌、摸牌区与操作按钮区域。
-   - 亦可通过【扩展校准】添加四家牌河与宝牌指示牌区域。
+| 协议 | 默认完整请求地址 | 模型 |
+| --- | --- | --- |
+| Vercel Jev 评估 | `https://ai-gateway.vercel.sh/v4/ai/evaluation-model` | `typesafe-ai/jev-latest` |
+| TypeSafe System One | `https://api.typesafe.ai/v1/systemone` | `jev-latest` |
+| OpenRouter Jev System One | `https://openrouter.ai/api/v1/systemone` | `jev-latest` |
+| OpenAI 兼容 Chat Completions | `https://ai-gateway.vercel.sh/v1/chat/completions` | 填服务商提供的聊天模型 ID |
 
-3. **配置 AI 决策模型**：
-   - **TypeSafe Jev**：点击底部【Jev 设置】，填入 TypeSafe API Key（[获取 Key](https://typesafe.ai)）。
-   - **通用大模型**：点击底部【大模型设置】，填入 DeepSeek、OpenAI 或其他兼容接口的 Base URL、API Key 与模型名称（默认为 `deepseek-chat`）。
+请求地址可以修改为自己的服务地址。不同协议的请求 JSON 与返回结构不同；Jev 使用评估协议。聊天协议要求模型返回候选动作 ID 的 JSON，返回候选以外的动作会被拒绝。未返回概率的模型不会显示编造的概率柱状图。
 
----
+Key 不会出现在决策日志中。已保存的 Key 优先；仅在对应协议的官方 HTTPS 地址下，允许从 `AI_GATEWAY_API_KEY`、`TYPESAFE_API_KEY`、`OPENROUTER_API_KEY` 补充缺失的 Key。自定义地址不会自动取得这些环境变量。切换协议会清空输入框，须填写该渠道自己的 Key。
 
-## 快捷键与操作
+配置保存在本机用户目录的 `mahjong-jev-advisor/settings.json`，Key 为本机明文，勿分享此文件。保存使用原子替换；损坏的配置重新保存前会备份为 `settings.invalid.json`。开发和测试可用 `MAHJONG_ADVISOR_CONFIG_DIR` 指定独立配置目录。
 
-| 快捷操作 | 作用说明 |
-| :--- | :--- |
-| **拖动标题栏 / 空白区** | 自由移动赛博朋克 HUD 悬浮窗 |
-| **Ctrl + 鼠标滚轮** | 悬浮窗透明度调节 (45% ~ 100%) |
-| **点击手牌中任意一张牌** | 触发交互式模拟切牌，即时推演该打法之向听数、有效进张与危险级 |
-| **点击【展开四家】** | 切换展开/收起四家状态卡片与紧凑牌河 |
-| **点击【大模型推演】** | 呼出 DeepSeek / OpenAI 大模型深度战术复盘对话框 |
-| **点击【暂停/恢复识别】** | 一键启停后台屏幕截屏分析 |
+### Jev 接入渠道
 
----
+- **TypeSafe 官方直连**：[获取 Key](https://console.typesafe.ai/keys) · [官方文档](https://docs.typesafe.ai/introduction/quickstart)。选择 TypeSafe 预设。
+- **OpenRouter**：[获取 Key](https://openrouter.ai/settings/keys) · [Jev 官方接入说明](https://openrouter.ai/docs/guides/community/jev)。选择 OpenRouter 预设，使用原生 System One 接口和 `jev-latest`；不要把 `typesafe/jev-router` 聊天路由模型当作此接口。
+- **Vercel AI Gateway**：[控制台](https://vercel.com/ai-gateway) · [评估模型文档](https://ai-sdk.dev/docs/ai-sdk-core/evaluation)。选择 Vercel 预设；账户需满足其账单验证和额度要求。
 
-## 开发者与测试
+网页试用入口：[TypeSafe Playground](https://console.typesafe.ai/playground)、[OpenRouter Jev Lab](https://openrouter.ai/labs/jev)。这两项是体验入口；桌面程序仍需相应平台 API Key。各平台是否可用、是否需要充值，以账户实际权限为准。
 
-本项目采用严格的工程化测试标准，覆盖了役种计算、打点估算、向听搜索、危险度评估、视觉 OCR、大模型连接与 Qt UI 组件：
+超时默认 15 秒，可在设置中调整；实际响应耗时由服务和网络决定，不能保证 2 秒。网络故障的本地回退默认关闭，可在设置中明确开启；认证、账单或无效答案不会被当成连接成功。
+
+### 常见真实服务错误
+
+- `401`：检查 Key 和所选服务是否对应。
+- `403 customer_verification_required`：Vercel 要求账户先完成账单验证、绑定有效信用卡。更换客户端请求格式不能解决这个账户限制。
+- `402`：检查服务余额或额度。
+- `404` 或非 JSON 返回：检查完整接口路径。
+- `429`：服务限流。
+
+2026-09-28 较早的检查曾使用本机凭据发起实际 Vercel 请求，并在设置界面复现 `403 customer_verification_required`。尚未取得该账户的成功在线推断结果。后续审查测试意外覆盖了本机配置，未找到可恢复备份；已恢复空白默认配置，需重新填写 Key 和框选牌桌。测试现已增加整个配置根目录的隔离及回归检查。
+
+## 再准备牌局识别
+
+连接测试无需打开雀魂，但实时建议需要可用的牌局状态：
+
+1. 在【桌】→【选择牌桌画面】框选雀魂网页版的完整牌桌。
+2. 在【基础校准】框选手牌、摸牌和操作按钮区域；其他公开区域可在【扩展校准】补充。
+3. 在【标注牌面样本】提供当前分辨率、牌背/牌面样式对应的样本。项目不附带可覆盖所有雀魂界面样式的预训练视觉识别器。
+4. 点击【开始识别】。识别矛盾或置信度不足时暂停建议，并清除之前的推荐；可以通过【手动核对】输入真实牌局继续。
+
+只选择牌桌、未校准区域时，程序会显示“待校准”。启动默认显示空状态，不再自动展示示范概率。手动核对后的牌局也会走正式在线决策请求。
+
+Windows 上修复了 64 位 `SetWindowDisplayAffinity` 调用；若系统不能排除顾问窗口，程序提示把窗口移到牌桌外，不再周期性隐藏/显示窗口而打断拖动。
+
+## 验证范围
 
 ```bash
-# 安装开发测试依赖
-pip install -e '.[dev]'
-
-# 运行完整测试套件 (36 个测试用例)
-pytest -v
+.venv/Scripts/python.exe -m pytest -q
 ```
 
----
+目前 85 项测试通过，包含 34 种标准牌与三种赤五的 Hook 状态重建、37 种互不相同的牌面绘制、四个座位及四家牌河/副露/分数/立直、吃碰与明暗加杠、全部操作按钮、规则与 UI 检查、四个模型协议的真实本机 HTTP 往返、配置对话框发请求、后台决策到界面更新、Hook 同步恢复与诊断、错误处理与旧建议清除，以及渠道 Key 隔离、配置损坏恢复、摸牌低置信度不污染历史、矛盾吃碰杠和无效概率拒绝。测试 HTTP 服务是本机受控服务，不代表远程服务账户已可用。
 
-## 许可证
+2026-09-29 已使用独立 Chromium 加载本项目扩展访问 `https://game.maj-soul.com/`，确认扩展在 Unity 页面主执行环境完成注入、替换 `window.WebSocket`，并捕获 `wss://route-5.maj-soul.com:443/gateway` 的真实二进制收发帧。该检查未登录账号、未进入牌局，因此不等同于完整实战手牌重建验收。
 
-本项目遵循 [MIT License](LICENSE) 开源协议。
+本机 Python 3.12.14、依赖检查、OCR 模型初始化及 1920×1080 屏幕采集已通过。当前基础/扩展区域未校准，牌面模板为 0/38 类。`readiness-report.json` 记录本次实际结果。回放输出与帧数统计已修复；JSONL 状态回放的耗时不包含屏幕识别，不能用来证明端到端 2 秒目标。
+
+已实测 Windows 系统标题栏拖动；本轮没有完成 macOS 真机、跨屏混合 DPI、雀魂完整录屏识别准确率或 P95 延迟验收。项目目前仍需校准与样本标注，不宣称达到 98%/99% 的识别指标。
+
+规则与视觉仍有边界：固定网格模板需要与实际牌桌布局吻合；副露目前是平铺牌列表，对暗杠、加杠、吃后禁打和立直后操作等复杂状态尚未完成完整牌谱验收。因此不能声称在所有牌局中非法动作建议为零。请先用观战/回放与手动核对验证。

@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import numpy as np
 
-from mahjong_jev_advisor.tiles import TILES
-from mahjong_jev_advisor.vision import TemplateStore, VisionReader, parse_buttons
+from mahjong_jev_advisor.tiles import RED_TILES, TILES
+from mahjong_jev_advisor.vision import (
+    TEMPLATE_LABELS, TemplateStore, VisionReader, detect_basic_regions, learn_templates_from_state, parse_buttons,
+)
+
+
+def test_template_catalog_covers_all_standard_and_red_tiles():
+    assert set(TILES + RED_TILES) <= set(TEMPLATE_LABELS)
+    assert "empty" in TEMPLATE_LABELS
+from mahjong_jev_advisor.state import GameState
 
 
 def test_multilingual_action_buttons():
     assert parse_buttons("立直 过") == {"riichi", "pass"}
     assert parse_buttons("ロン パス") == {"ron", "pass"}
+    assert parse_buttons("跳遇119 碰") == {"pon", "pass"}
     assert parse_buttons("和", self_draw=True) == {"tsumo"}
-    assert parse_buttons("和", self_draw=False) == {"ron"}
+    assert parse_buttons("和", self_draw=False) == {"ron", "pass"}
 
 
 def test_template_roundtrip(tmp_path):
@@ -36,6 +45,18 @@ def test_riichi_stick_color_detection():
     red[5:15, 10:90] = (0, 0, 220)
     assert not VisionReader._riichi_stick_present(green)
     assert VisionReader._riichi_stick_present(red)
+
+
+def test_auto_detect_and_bootstrap_hand_templates(tmp_path):
+    frame = np.zeros((800, 1400, 3), dtype=np.uint8)
+    # Thirteen touching pale tiles form the same visual anchor as the web client.
+    frame[680:780, 180:1155] = (220, 223, 222)
+    regions = detect_basic_regions(frame)
+    assert {"hand", "draw", "buttons"} <= set(regions)
+    store = TemplateStore(tmp_path)
+    state = GameState.from_dict({"hand": "123m456p789s123z5m"})
+    saved = learn_templates_from_state(frame, regions, state, store)
+    assert saved >= 14 and store.samples
 
 
 def test_calibrated_synthetic_frame_recovers_complete_hand(tmp_path):

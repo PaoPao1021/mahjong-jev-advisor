@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mahjong-jev-advisor"
 version = "0.1.0"
-description = "Read-only Mahjong Soul screen advisor with TypeSafe Jev"
+description = "Read-only Mahjong Soul screen advisor with Jev via Vercel AI Gateway"
 requires-python = ">=3.12"
 dependencies = [
   "PySide6>=6.8,<7",
@@ -22,9 +22,13 @@ dev = ["pytest>=8,<10"]
 [project.scripts]
 mahjong-jev-advisor = "mahjong_jev_advisor.app:main"
 mahjong-jev-replay = "mahjong_jev_advisor.replay:main"
+mahjong-jev-check = "mahjong_jev_advisor.preflight:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mahjong_jev_advisor = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

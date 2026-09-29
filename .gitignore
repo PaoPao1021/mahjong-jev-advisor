@@ -7,3 +7,9 @@ __pycache__/
 build/
 dist/
 *.log
+.playwright-cli/
+browser-extension.pem
+browser-extension.crx
+readiness-report.json
+current_ui.png
+updated_ui.png

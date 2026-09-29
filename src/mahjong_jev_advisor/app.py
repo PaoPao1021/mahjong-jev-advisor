@@ -14,13 +14,15 @@ from typing import Any
 import cv2
 import mss
 import numpy as np
-from PySide6.QtCore import QPoint, QRect, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QMouseEvent
+from PySide6.QtCore import QEvent, QPoint, QRect, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFrame, QMainWindow, QMenu, QMessageBox, QVBoxLayout, QWidget,
+    QApplication, QDialog, QFrame, QLayout, QMainWindow, QMenu, QMessageBox,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 
 from .jev import JevError, advise
+from .hook import HookBridge
 from .rules import (
     NoDecision, UncertainState, candidates, danger, dora_value,
     shanten, shanten_text, ukeire_details, yaku_hints,
@@ -35,63 +37,41 @@ from .ui_dialogs import (
     JevSettingsDialog, LLMAnalysisDialog, LLMSettingsDialog, ManualStateDialog,
     RegionDialog, TemplateDialog,
 )
-from .vision import REGIONS, Observation, TemplateStore, VisionReader
+from .vision import (
+    REGIONS, Observation, TemplateStore, VisionReader, detect_basic_regions,
+    learn_templates_from_state,
+)
+
+
+def overlay_size_for_screen(available: QRect) -> tuple[int, int]:
+    """Return a usable logical-pixel HUD size for the current screen."""
+    return min(390, max(320, available.width() - 24)), min(720, max(320, available.height() - 64))
+
+
+def exclude_window_from_capture(hwnd: int) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        setter = ctypes.windll.user32.SetWindowDisplayAffinity
+        setter.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        setter.restype = ctypes.c_int
+        return bool(setter(hwnd, 0x11))
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def capture_box(box: tuple[int, int, int, int]) -> np.ndarray:
     x, y, width, height = box
-    with mss.mss() as grabber:
+    with mss.MSS() as grabber:
         image = np.asarray(grabber.grab({"left": x, "top": y, "width": width, "height": height}))
     return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
 
 
 def capture_desktop() -> tuple[np.ndarray, tuple[int, int]]:
-    with mss.mss() as grabber:
+    with mss.MSS() as grabber:
         monitor = grabber.monitors[0]
         image = np.asarray(grabber.grab(monitor))
     return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR), (monitor["left"], monitor["top"])
-
-
-def apply_blur_effect(hwnd: int) -> None:
-    """Applies Windows DWM blur behind / acrylic effect for real frosted glass HUD."""
-    if sys.platform != "win32":
-        return
-    try:
-        class ACCENT_POLICY(ctypes.Structure):
-            _fields_ = [
-                ("AccentState", ctypes.c_int),
-                ("AccentFlags", ctypes.c_int),
-                ("GradientColor", ctypes.c_uint),
-                ("AnimationId", ctypes.c_int),
-            ]
-
-        class WINDOW_COMPOSITION_ATTRIB_DATA(ctypes.Structure):
-            _fields_ = [
-                ("Attribute", ctypes.c_int),
-                ("Data", ctypes.c_void_p),
-                ("SizeOfData", ctypes.c_size_t),
-            ]
-
-        policy = ACCENT_POLICY()
-        policy.AccentState = 3  # ACCENT_ENABLE_BLURBEHIND
-        policy.AccentFlags = 2
-        policy.GradientColor = 0x88101626  # Semi-transparent dark ARGB tint
-
-        data = WINDOW_COMPOSITION_ATTRIB_DATA()
-        data.Attribute = 19  # WCA_ACCENT_POLICY
-        data.Data = ctypes.cast(ctypes.pointer(policy), ctypes.c_void_p)
-        data.SizeOfData = ctypes.sizeof(policy)
-
-        set_window_composition_attribute = ctypes.windll.user32.SetWindowCompositionAttribute
-        set_window_composition_attribute.restype = ctypes.c_int
-        set_window_composition_attribute.argtypes = [ctypes.c_void_p, ctypes.POINTER(WINDOW_COMPOSITION_ATTRIB_DATA)]
-        set_window_composition_attribute(hwnd, ctypes.byref(data))
-    except Exception:
-        pass
-
-
-class WorkerSignals:
-    pass
 
 
 from PySide6.QtCore import QObject
@@ -119,16 +99,17 @@ class CaptureWorker(QRunnable):
 
 
 class AdviceWorker(QRunnable):
-    def __init__(self, state: GameState, key: str):
+    def __init__(self, state: GameState, key: str, connection=None):
         super().__init__()
         self.state, self.key = state, key
+        self.connection = connection
         self.signals = TaskSignals()
 
     def run(self) -> None:
         try:
             start = time.perf_counter()
             options = candidates(self.state)
-            advice = advise(self.state, options, self.key)
+            advice = advise(self.state, options, self.key, connection=self.connection)
             elapsed = int((time.perf_counter() - start) * 1000)
             object.__setattr__(advice, "latency_ms", elapsed)
             self.signals.done.emit((self.state.identity(), advice, self.state))
@@ -148,7 +129,7 @@ def _demo_reference_state() -> GameState:
             ["3m", "8m", "1s", "3z", "2m", "4m", "6s", "2m", "1m", "5p", "9s", "3p"],
             ["5z", "8m", "3m", "7z", "2p", "3s", "8p", "6m", "1p", "4s", "2s"],
             ["7p", "1z", "4z", "3z", "1m", "3m", "3p", "4z", "6p", "9m", "5s"],
-            ["1z", "2z", "2p", "9s", "1z", "4s", "7p", "5p", "8s", "3m"],
+            ["1z", "2z", "2p", "9s", "1z", "4s", "7p", "5p", "8s", "6z"],
         ],
         "melds": [[], [], ["3m", "4m", "5m"], []],
         "dora_indicators": ["7p"],
@@ -170,13 +151,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("雀魂 · Jev 实时切牌顾问")
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
 
         self.settings = Settings.load()
         self._capture_excluded = False
         self.templates = TemplateStore()
         self.reader = VisionReader(self.settings.regions, self.templates)
+        self.hook = HookBridge()
+        self.hook.signals.state.connect(self.on_hook_state)
+        self.hook.signals.status.connect(self.on_hook_status)
         self.pool = QThreadPool.globalInstance()
 
         self.capture_busy = False
@@ -190,7 +173,12 @@ class MainWindow(QMainWindow):
         self.advised_identity: tuple[Any, ...] | None = None
         self.active_advice_identity: tuple[Any, ...] | None = None
         self._current_chosen: Candidate | None = None
-        self._drag_pos: QPoint | None = None
+        self._demo_preview = False
+        self._screen_bound = False
+        self._connection_revision = 0
+        self._active_connection_revision = 0
+        self._table_user_override = False
+        self._hook_active = False
 
         # Build Main Glassmorphic HUD Layout
         panel = QFrame()
@@ -210,25 +198,43 @@ class MainWindow(QMainWindow):
         self.title_bar.close_clicked.connect(self.close)
         root_layout.addWidget(self.title_bar)
 
+        # Keep controls visible while dense table and decision details scroll on
+        # shorter screens (including 720p and scaled laptop displays).
+        self.content_scroll = QScrollArea(self)
+        self.content_scroll.setObjectName("hudContentScroll")
+        self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.content_scroll.viewport().installEventFilter(self)
+        content = QWidget()
+        content.setObjectName("hudScrollableContent")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(6)
+        content_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.content_scroll.setWidget(content)
+        root_layout.addWidget(self.content_scroll, 1)
+
         # 2. Round Info Bar (东1局 · 余 29 · 3北 · 宝牌)
         self.round_bar = RoundInfoBar(self)
-        root_layout.addWidget(self.round_bar)
+        content_layout.addWidget(self.round_bar)
 
         # 3. Four-player status card with rivers
         self.table_card = FourPlayersRiverWidget(self)
         self.table_card.setVisible(self.settings.show_table)
-        root_layout.addWidget(self.table_card)
+        content_layout.addWidget(self.table_card)
 
         # 4. Hand & Draw Strip with Glowing Highlight
         self.hand_widget = HandWidget(self)
         self.hand_widget.toggle_table.connect(self.toggle_table_visibility)
         self.hand_widget.tile_clicked.connect(self.on_hand_tile_clicked)
-        root_layout.addWidget(self.hand_widget)
+        content_layout.addWidget(self.hand_widget)
 
         # 5. Hero Decision Card (Probability bars, recommendation tile, pills)
         self.hero_card = DecisionHeroCard(self)
         self.hero_card.alternative_clicked.connect(self.on_hand_tile_clicked)
-        root_layout.addWidget(self.hero_card, 1)
+        content_layout.addWidget(self.hero_card)
+        content_layout.addStretch()
 
         # 6. Bottom Action & Status Bar
         self.bottom_bar = BottomActionBar(self)
@@ -241,8 +247,12 @@ class MainWindow(QMainWindow):
         self.bottom_bar.manual_clicked.connect(self.manual_state)
         root_layout.addWidget(self.bottom_bar)
 
-        self.setMinimumWidth(380)
-        self.resize(390, 720)
+        self.setMinimumSize(320, 320)
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen is not None:
+            self._adapt_to_screen(screen)
+        else:
+            self.resize(390, 720)
         self.setWindowOpacity(self.settings.opacity)
 
         # Periodic capture timer
@@ -250,15 +260,21 @@ class MainWindow(QMainWindow):
         self.timer.setInterval(self.settings.ui_interval_ms)
         self.timer.timeout.connect(self.capture_tick)
 
-        # Load reference preview initially so user instantly sees full graphics
-        self._load_initial_preview()
+        self.clear_state()
+        self.hook.start()
 
         # If game_box is configured, automatically start real-time monitoring
-        if self.settings.game_box:
+        if self.settings.game_box and all(name in self.settings.regions for name in ("hand", "draw", "buttons")):
             QTimer.singleShot(300, self.toggle_recognition)
+        elif self.settings.game_box:
+            self.title_bar.set_status("待校准", "warning")
+            self.bottom_bar.set_status_info("牌桌已选择，识别未就绪", "请在【桌】完成基础校准和牌面样本标注")
         else:
             self.title_bar.set_status("待选牌桌", "idle")
             self.bottom_bar.set_status_info("等待绑定", "点击右上角【桌】绑定雀魂窗口以开启实时监测")
+        if self.settings.load_warning:
+            self.title_bar.set_status("配置待修复", "warning")
+            self.bottom_bar.set_status_info("配置读取异常", self.settings.load_warning)
 
     def set_opacity(self, opacity: float) -> None:
         self.settings.opacity = max(0.45, min(1.0, float(opacity)))
@@ -280,8 +296,19 @@ class MainWindow(QMainWindow):
         else:
             super().wheelEvent(event)
 
+    def eventFilter(self, watched: Any, event: Any) -> bool:
+        if (
+            watched is self.content_scroll.viewport()
+            and event.type() == QEvent.Type.Wheel
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self.wheelEvent(event)
+            return True
+        return super().eventFilter(watched, event)
+
     def _load_initial_preview(self) -> None:
         """Loads a demo state resembling the reference image so UI looks spectacular out-of-the-box."""
+        self._demo_preview = True
         demo = _demo_reference_state()
         self.last_state = demo
         self._render_state(demo)
@@ -313,17 +340,20 @@ class MainWindow(QMainWindow):
             draw_info="摸切 6",
             melds_count=2,
             alternatives=["2s", "4p"],
-            source_note="Jev · 校准概率可视化",
+            source_note="界面示例 · 非实时 Jev 输出",
             raw_detail="2向听 · 有效牌约 24 张 · 危险级 1 · 役牌候选、门清",
         )
+        self.hero_card.stats_line_1.setText("示例选择比例 0.83 · 示例置信度 0.78")
+        self.hero_card.stats_line_2.setText("示例风险分 1.03 · 非真实牌局测量")
         self.hand_widget.set_hand(demo.hand, highlight_tile="1p")
         self.bottom_bar.set_status_info(
-            "AI 建议 Jev jev-latest · 桥OK",
-            "切 1p  ·  置信 78%  ·  弃和 28%",
+            "示范牌局 · 非实时",
+            "示例牌面与概率，仅用于预览界面",
         )
-        self.title_bar.set_status("对局中", "active")
+        self.title_bar.set_status("示范中", "idle")
 
     def toggle_table_visibility(self) -> None:
+        self._table_user_override = True
         new_visible = not self.table_card.isVisible()
         self.table_card.setVisible(new_visible)
         self.settings.show_table = new_visible
@@ -332,32 +362,32 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event: Any) -> None:
         super().showEvent(event)
-        if sys.platform == "win32":
-            apply_blur_effect(int(self.winId()))
-            if not self._capture_excluded:
-                try:
-                    # Exclude overlay window from screen capture on Windows 10 2004+
-                    self._capture_excluded = bool(ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x11))
-                except (AttributeError, OSError, ValueError):
-                    pass
+        if not self._screen_bound and self.windowHandle() is not None:
+            self.windowHandle().screenChanged.connect(self._on_screen_changed)
+            self._screen_bound = True
+        if not self._capture_excluded:
+            self._capture_excluded = exclude_window_from_capture(int(self.winId()))
 
-    def mousePressEvent(self, event: Any) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
+    def _adapt_to_screen(self, screen: Any) -> None:
+        available = screen.availableGeometry()
+        self.resize(*overlay_size_for_screen(available))
+        compact = available.height() < 760
+        self.content_scroll.widget().layout().setSpacing(4 if compact else 6)
+        self.hero_card.layout().setSpacing(4 if compact else 8)
+        self.hero_card.layout().setContentsMargins(10 if compact else 12, 8 if compact else 10,
+                                                  10 if compact else 12, 8 if compact else 10)
+        if not self._table_user_override:
+            show_table = self.settings.show_table and not compact
+            self.table_card.setVisible(show_table)
+            self.hand_widget.btn_toggle.setText("隐藏四家" if show_table else "展开四家")
+        if self.isVisible():
+            x = max(available.left(), min(self.x(), available.right() - self.width() + 1))
+            y = max(available.top(), min(self.y(), available.bottom() - self.height() + 1))
+            self.move(x, y)
 
-    def mouseMoveEvent(self, event: Any) -> None:
-        if event.buttons() & Qt.MouseButton.LeftButton and self._drag_pos is not None:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: Any) -> None:
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
+    def _on_screen_changed(self, screen: Any) -> None:
+        # Never reposition or resize during a system drag; that makes the window jump.
+        pass
 
     def _on_ai_menu(self) -> None:
         menu = QMenu(self)
@@ -371,6 +401,9 @@ class MainWindow(QMainWindow):
 
     def _on_table_menu(self) -> None:
         menu = QMenu(self)
+        menu.addAction("打开网页 Hook 扩展目录", self.open_hook_extension)
+        menu.addAction("查看网页 Hook 诊断", self.show_hook_diagnostic)
+        menu.addSeparator()
         menu.addAction("选择牌桌画面", self.select_game)
         menu.addAction("基础区域校准", lambda: self.calibrate(False))
         menu.addAction("扩展区域校准", lambda: self.calibrate(True))
@@ -387,6 +420,33 @@ class MainWindow(QMainWindow):
         ]:
             op_menu.addAction(title, lambda v=val: self._select_opacity(v))
         menu.exec(self.title_bar.btn_table.mapToGlobal(QPoint(0, self.title_bar.btn_table.height() + 2)))
+
+    def open_hook_extension(self) -> None:
+        directory = Path(__file__).resolve().parents[2] / "browser-extension"
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+        self.bottom_bar.set_status_info("网页 Hook 扩展目录已打开", "在浏览器扩展页选择“加载解压缩的扩展”")
+
+    def show_hook_diagnostic(self) -> None:
+        info = self.hook.browser_diagnostic
+        if not info:
+            detail = "尚未收到浏览器诊断。请重载扩展，再刷新雀魂页面。"
+        else:
+            browser_frames = int(info.get("sentFrames", 0) or 0) + int(info.get("receivedFrames", 0) or 0)
+            detail = "\n".join([
+                f"扩展版本：{info.get('extensionVersion') or '未知'}",
+                f"页面 Hook：{'已注入' if info.get('hookReady') else '未注入'}",
+                f"雀魂 WebSocket：{int(info.get('socketCount', 0) or 0)} 个",
+                f"浏览器捕获帧：{browser_frames}",
+                f"桌面端接收帧：{self.hook.frames_seen}",
+                f"协议消息：{self.hook.protocol.messages_seen}",
+                f"已重建牌局状态：{self.hook.states_seen}",
+                f"解码错误：{self.hook.decode_errors}",
+                f"最近事件：{self.hook.protocol.last_message_name or '无'}",
+                f"连接主机：{info.get('lastSocketHost') or '尚未建立'}",
+            ])
+            if self.hook.last_error:
+                detail += f"\n最近错误：{self.hook.last_error}"
+        QMessageBox.information(self, "网页 Hook 诊断", detail)
 
     def _render_state(self, state: GameState, highlight_tile: str | None = None) -> None:
         # Hand & drawn tile
@@ -467,7 +527,7 @@ class MainWindow(QMainWindow):
     def on_advice(self, result: tuple[tuple[Any, ...], Advice, GameState]) -> None:
         self.advice_busy = False
         identity, advice, state = result
-        if identity != self.pending_identity:
+        if identity != self.pending_identity or self._active_connection_revision != self._connection_revision:
             self._start_latest_if_needed()
             return
 
@@ -481,6 +541,8 @@ class MainWindow(QMainWindow):
 
         # Calculate rich stats (fold rate, danger score, bars)
         fold_rate, danger_score, bar_items = self._calculate_metrics(state, chosen)
+        if advice.source == "jev":
+            bar_items = []
 
         # If Jev returned explicit probabilities, merge them
         if advice.source == "jev" and advice.probabilities:
@@ -505,9 +567,10 @@ class MainWindow(QMainWindow):
         alternatives_list = [alt.tile or alt.label for alt in advice.alternatives[:3]]
 
         source_note = (
-            f"Jev {advice.model or 'latest'} · 校准概率可视化 · {advice.latency_ms}ms"
+            f"在线模型 {advice.model or 'latest'} · {advice.latency_ms}ms"
             if advice.source == "jev"
-            else "本地规则确定性引擎"
+            else "Jev 故障回退 · 本地规则" if advice.note.startswith("Jev 不可用")
+            else "确定性规则"
         )
 
         yaku_badge = ""
@@ -521,7 +584,7 @@ class MainWindow(QMainWindow):
             action_name=action_name,
             rec_tile=rec_tile,
             shanten_num=chosen.shanten,
-            confidence=advice.confidence or 0.82,
+            confidence=advice.confidence,
             probabilities=bar_items,
             fold_rate=fold_rate,
             danger_score=danger_score,
@@ -531,11 +594,17 @@ class MainWindow(QMainWindow):
             source_note=source_note,
             raw_detail=chosen.rationale,
             yaku_badge=yaku_badge,
+            probability_label="Jev 选择概率" if advice.source == "jev" else "规则相对评分",
         )
 
+        status_title = (
+            f"AI 建议 Jev {advice.model or 'latest'}"
+            if advice.source == "jev" else source_note
+        )
+        confidence_summary = f"置信 {advice.confidence:.0%}" if advice.confidence is not None else "未提供置信度"
         self.bottom_bar.set_status_info(
-            f"AI 建议 Jev {advice.model or 'latest'} · 桥OK",
-            f"切 {rec_tile or chosen.label}  ·  置信 {int((advice.confidence or 0.8) * 100)}%  ·  弃和 {fold_rate}%",
+            status_title,
+            f"切 {rec_tile or chosen.label}  ·  {confidence_summary}  ·  防守倾向 {fold_rate}/100",
         )
         self.title_bar.set_status("对局中", "active")
 
@@ -549,10 +618,18 @@ class MainWindow(QMainWindow):
     def on_advice_failure(self, result: tuple[tuple[Any, ...], str]) -> None:
         self.advice_busy = False
         identity, error = result
-        if identity != self.pending_identity:
+        if identity != self.pending_identity or self._active_connection_revision != self._connection_revision:
             self._start_latest_if_needed()
             return
         self.advised_identity = identity
+        self._current_chosen = None
+        self.hero_card.update_decision(
+            action_name="决策未就绪", rec_tile="", shanten_num=None, confidence=None,
+            probabilities=[], fold_rate=0, danger_score=0, draw_info="—",
+            melds_count=self.last_state.open_melds if self.last_state else 0,
+            alternatives=[], source_note="在线模型请求失败",
+            raw_detail=error.splitlines()[-1],
+        )
         self.bottom_bar.set_status_info("AI 决策未就绪", error.splitlines()[-1])
         self.title_bar.set_status("等待输入", "warning")
 
@@ -570,31 +647,48 @@ class MainWindow(QMainWindow):
         if self.advice_busy:
             return
         if not self.settings.api_key:
-            # Fall back to local rules
             self.advised_identity = state.identity()
-            try:
-                opts = candidates(state)
-                chosen = opts[0]
-                advice = Advice(chosen, opts[1:4], source="rules", note="本地规则推算（未填 API Key）")
-                self.on_advice((state.identity(), advice, state))
-            except Exception as e:
-                self.bottom_bar.set_status_info("本地规则推算", str(e))
+            self._current_chosen = None
+            self.hero_card.update_decision(
+                action_name="待连接", rec_tile="", shanten_num=None, confidence=None,
+                probabilities=[], fold_rate=0, danger_score=0, draw_info="—",
+                melds_count=state.open_melds, alternatives=[],
+                source_note="等待 API Key",
+                raw_detail="牌局状态已准备好。请在模型设置填写 API Key 和请求地址，并测试连接。",
+            )
+            self.bottom_bar.set_status_info("Jev 待连接", "填写 API Key 和请求地址后测试连接")
+            self.title_bar.set_status("待连接", "warning")
             return
 
         self.advice_busy = True
+        self._current_chosen = None
+        self.hero_card.update_decision(action_name="请求中", rec_tile="", shanten_num=None,
+            confidence=None, probabilities=[], alternatives=[], source_note="等待真实模型响应",
+            raw_detail=f"模型：{self.settings.model_name}；超时上限 {self.settings.model_timeout:g} 秒")
+        self._active_connection_revision = self._connection_revision
         self.active_advice_identity = state.identity()
-        worker = AdviceWorker(state, self.settings.api_key)
+        worker = AdviceWorker(state, self.settings.api_key, self.settings.connection())
         worker.signals.done.connect(self.on_advice)
         worker.signals.failed.connect(self.on_advice_failure)
         self.pool.start(worker)
 
     def _force_recompute_advice(self) -> None:
-        if self.last_state:
+        if self._demo_preview:
+            self.bottom_bar.set_status_info("等待真实牌局", "请先识别牌桌或手动核对，再请求 Jev 建议")
+            return
+        if self.last_state and self.last_state.hand:
             self.advised_identity = None
+            self.pending_identity = self.last_state.identity()
             self.start_advice(self.last_state)
+        else:
+            self.bottom_bar.set_status_info("等待真实牌局", "可在模型设置测试连接；实时建议需识别牌桌或手动核对牌面")
 
     def clear_state(self) -> None:
         """Clears current hand and state to fresh."""
+        self.pending_identity = None
+        self.advised_identity = None
+        self.stable_count = 0
+        self._demo_preview = False
         self._current_chosen = None
         empty_state = GameState.from_dict({
             "hand": [],
@@ -606,6 +700,9 @@ class MainWindow(QMainWindow):
         })
         self.last_state = empty_state
         self._render_state(empty_state)
+        self.round_bar.round_text.setText("等待识别局况")
+        for row in self.table_card.rows:
+            row.score_label.setText("—")
         self.hero_card.update_decision(
             action_name="待机",
             rec_tile="",
@@ -632,20 +729,105 @@ class MainWindow(QMainWindow):
             self.bottom_bar.set_status_info("实时监测已暂停", "点击【开始识别】恢复后台监测")
             return
 
+        if self.hook.connected:
+            # A loopback ping proves only that the extension reached this app.
+            # Keep the calibrated screen reader available until the Hook has
+            # decoded an actual game state.
+            self._hook_active = self.hook.live_ready
+            self._begin_realtime("网页 Hook 已连接 · 正在等待真实牌局数据")
+            return
+
         if not self.settings.game_box:
             QMessageBox.information(self, "请先选牌桌", "请点击右上角【桌】→【选择牌桌画面】框选雀魂。")
             return
 
+        missing = [title for name, title, _, _, required in REGIONS if required and name not in self.settings.regions]
+        if missing:
+            frame = self._capture_without_overlay(self.settings.game_box)
+            detected = detect_basic_regions(frame)
+            if not all(name in detected for name in ("hand", "draw", "buttons")):
+                self.bottom_bar.set_status_info("自动校准失败", "请在【桌】→【基础区域校准】手动框选")
+                self.title_bar.set_status("待校准", "warning")
+                return
+            self.settings.regions.update(detected)
+            self.settings.save()
+            self.reader = VisionReader(self.settings.regions, self.templates)
+            self.bottom_bar.set_status_info("已自动定位牌面", "请核对一次当前手牌，随后将自动连续识别")
+            self.manual_state(training_frame=frame, force_resume=True)
+            return
+
+        if not self.templates.samples:
+            frame = self._capture_without_overlay(self.settings.game_box)
+            self.bottom_bar.set_status_info("首次识别学习", "请核对一次当前手牌，完成后自动连续监测")
+            self.manual_state(training_frame=frame, force_resume=True)
+            return
+
+        if self._demo_preview:
+            self.clear_state()
+        self._begin_realtime()
+
+    def _begin_realtime(self, detail: str | None = None) -> None:
         self.manual = False
         self.running = True
         self.bottom_bar.btn_toggle.setText("暂停识别")
         self.title_bar.set_status("实时监测中", "active")
-        self.bottom_bar.set_status_info("实时监测运行中", f"采样间隔 {self.settings.ui_interval_ms}ms · 画面捕获中")
-        self.timer.start()
-        self.capture_tick()
+        self.bottom_bar.set_status_info(
+            "实时监测运行中", detail or f"每 {self.settings.ui_interval_ms}ms 采集一次 · 牌局变化后自动请求 Jev"
+        )
+        if self._hook_active:
+            self.timer.stop()
+        else:
+            self.timer.start()
+            self.capture_tick()
+
+    def on_hook_status(self, message: str) -> None:
+        if message == "网页 Hook 协议已就绪":
+            if not self.running:
+                self._begin_realtime("网页 Hook 已注入 · 等待真实牌局事件")
+            else:
+                self.bottom_bar.set_status_info(message, "正在等待雀魂牌局事件")
+        elif not self.running:
+            self.title_bar.set_status("Hook 就绪", "active")
+            self.bottom_bar.set_status_info(message, "已连接到浏览器扩展")
+        else:
+            self.bottom_bar.set_status_info(message, "网页 Hook 实时诊断")
+
+    def on_hook_state(self, state: GameState) -> None:
+        self.last_state = state
+        self._demo_preview = False
+        self._render_state(state)
+        if not self.running:
+            self.bottom_bar.set_status_info("已捕获牌局状态", "点击【开始识别】开启 AI 自动切牌建议")
+            return
+        if not self._hook_active:
+            self._hook_active = True
+            self.timer.stop()
+        identity = state.identity()
+        if identity == self.advised_identity or self.advice_busy:
+            return
+        self.pending_identity = identity
+        self.stable_count = 2
+        self.advised_identity = None
+        self.start_advice(state)
 
     def capture_tick(self) -> None:
         if not self.running or self.manual or self.capture_busy or not self.settings.game_box:
+            return
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton or QApplication.activeModalWidget():
+            return
+        capture_rect = self.geometry()
+        if sys.platform == "win32":
+            from ctypes.wintypes import RECT
+            native_rect = RECT()
+            get_rect = ctypes.windll.user32.GetWindowRect
+            get_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+            get_rect.restype = ctypes.c_int
+            if get_rect(int(self.winId()), ctypes.byref(native_rect)):
+                capture_rect = QRect(native_rect.left, native_rect.top,
+                    native_rect.right - native_rect.left, native_rect.bottom - native_rect.top)
+        if not self._capture_excluded and capture_rect.intersects(QRect(*self.settings.game_box)):
+            self.on_capture_failure("顾问窗口遮挡了牌桌，无法取得当前画面")
+            self.bottom_bar.set_status_info("窗口遮挡牌桌", "系统不支持排除悬浮窗，请把顾问窗口移到牌桌区域外")
             return
         self.capture_busy = True
         worker = CaptureWorker(self.settings.game_box, self.reader, 0)
@@ -653,12 +835,7 @@ class MainWindow(QMainWindow):
         worker.signals.done.connect(self.on_observation)
         worker.signals.failed.connect(self.on_capture_failure)
 
-        if not self._capture_excluded and self.geometry().intersects(QRect(*self.settings.game_box)):
-            self.capture_hidden = True
-            self.hide()
-            QTimer.singleShot(40, lambda: self.pool.start(worker))
-        else:
-            self.pool.start(worker)
+        self.pool.start(worker)
 
     def _show_after_capture(self) -> None:
         if self.capture_hidden:
@@ -668,6 +845,12 @@ class MainWindow(QMainWindow):
     def on_capture_failure(self, error: str) -> None:
         self._show_after_capture()
         self.capture_busy = False
+        self.pending_identity = None
+        self.advised_identity = None
+        self.stable_count = 0
+        self._current_chosen = None
+        self.hero_card.update_decision(action_name="采集异常", rec_tile="", shanten_num=None,
+            confidence=None, probabilities=[], alternatives=[], source_note="画面不可用 · 暂停建议")
         self.bottom_bar.set_status_info("画面采集异常", error.splitlines()[-1])
         self.title_bar.set_status("采集异常", "warning")
 
@@ -677,6 +860,7 @@ class MainWindow(QMainWindow):
             return
 
         self.last_state = observation.state
+        self._demo_preview = False
         if observation.state:
             self._render_state(observation.state)
         else:
@@ -686,6 +870,10 @@ class MainWindow(QMainWindow):
         if observation.problems or observation.state is None or observation.confidence < 0.90:
             self.pending_identity = None
             self.stable_count = 0
+            self._current_chosen = None
+            self.hero_card.update_decision(action_name="待核对", rec_tile="", shanten_num=None,
+                confidence=None, probabilities=[], alternatives=[], source_note="识别不确定 · 暂停建议",
+                raw_detail="；".join(observation.problems) or "识别置信度不足")
             self.title_bar.set_status("核对中", "warning")
             self.bottom_bar.set_status_info("识别待核对", "；".join(observation.problems) or "置信度不足")
             return
@@ -726,7 +914,7 @@ class MainWindow(QMainWindow):
         x, y, width, height = chosen
         self.settings.game_box = (x + origin[0], y + origin[1], width, height)
         self.settings.save()
-        self.bottom_bar.set_status_info("已绑定牌桌", f"{width}×{height} · 自动开启实时监测")
+        self.bottom_bar.set_status_info("已绑定牌桌", f"{width}×{height} · 校准完成后可开启识别")
         if not self.running:
             self.toggle_recognition()
 
@@ -784,6 +972,13 @@ class MainWindow(QMainWindow):
         dialog = JevSettingsDialog(self.settings, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.settings.api_key = dialog.key.text().strip()
+            connection = dialog.connection()
+            self.settings.model_endpoint = connection.endpoint
+            self.settings.model_name = connection.model
+            self.settings.model_protocol = connection.protocol
+            self.settings.model_timeout = connection.timeout
+            self.settings.local_fallback = connection.local_fallback
+            self._connection_revision += 1
             self.settings.logging_enabled = dialog.log.isChecked()
             self.settings.save()
             self.bottom_bar.set_status_info("Jev 设置已保存", "API Key 已更新")
@@ -800,7 +995,7 @@ class MainWindow(QMainWindow):
 
     def show_llm_analysis(self) -> None:
         """Launches LLM deep tactical analysis dialog."""
-        if not self.last_state or not self.last_state.hand:
+        if self._demo_preview or not self.last_state or not self.last_state.hand:
             QMessageBox.information(self, "暂无局面", "当前没有可供大模型推演的牌面，请先选择牌桌开启识别或点击【手动核对】。")
             return
         if not self.settings.llm_api_key:
@@ -871,266 +1066,340 @@ class MainWindow(QMainWindow):
         )
         self.bottom_bar.set_status_info("手动模拟切牌", f"切 {tile}  ·  {shanten_text(s)}  ·  进张约 {u} 张  ·  危险级 {d}")
 
-    def manual_state(self) -> None:
+    def manual_state(self, training_frame: np.ndarray | None = None, force_resume: bool = False) -> None:
+        if training_frame is None and self.settings.game_box:
+            try:
+                training_frame = self._capture_without_overlay(self.settings.game_box)
+            except Exception:
+                training_frame = None
+        if training_frame is not None and not all(
+                name in self.settings.regions for name in ("hand", "draw", "buttons")):
+            detected = detect_basic_regions(training_frame)
+            if detected:
+                self.settings.regions.update(detected)
+                self.settings.save()
+                self.reader = VisionReader(self.settings.regions, self.templates)
         dialog = ManualStateDialog(self.last_state, self)
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.state is None:
             return
-        self.manual = True
+        resume = force_resume or dialog.learn_and_resume.isChecked()
+        learned = 0
+        if resume and training_frame is not None:
+            learned = learn_templates_from_state(
+                training_frame, self.settings.regions, dialog.state, self.templates
+            )
+        self.manual = not resume
         self.running = False
         self.timer.stop()
-        self.bottom_bar.btn_toggle.setText("恢复识别")
+        self.bottom_bar.btn_toggle.setText("恢复识别" if not resume else "暂停识别")
         self.last_state = dialog.state
+        self._demo_preview = False
         self._render_state(dialog.state)
         self.pending_identity = dialog.state.identity()
         self.stable_count = 2
         self.advised_identity = None
         self.bottom_bar.set_status_info("手动状态", "已加载手动输入的局面")
         self._start_latest_if_needed()
+        if resume:
+            self._begin_realtime(f"已学习 {learned} 个当前牌面样本 · 后续变化自动识别")
 
     def closeEvent(self, event: Any) -> None:
         self.timer.stop()
         self.running = False
         self.pool.waitForDone(1000)
+        self.hook.stop()
         super().closeEvent(event)
 
 
 HUD_STYLESHEET = """
-/* Cyberpunk Glassmorphic Translucent Theme for Mahjong HUD */
+/* Cyberpunk Deep Glassmorphic Translucent Theme for Mahjong HUD */
 
 QFrame#overlayContainer {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(16, 22, 38, 0.82), stop:1 rgba(10, 14, 25, 0.86));
-    border: 1.2px solid rgba(56, 189, 248, 0.35);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0d1322, stop:0.45 #090e18, stop:1 #060911);
+    border: 1.2px solid rgba(56, 189, 248, 0.40);
     border-radius: 14px;
+}
+
+QScrollArea#hudContentScroll, QWidget#hudScrollableContent {
+    background: transparent;
+    border: none;
+}
+QScrollArea#hudContentScroll QScrollBar:vertical {
+    background: rgba(10, 15, 26, 0.4);
+    width: 5px;
+    margin: 4px 1px;
+    border: none;
+    border-radius: 2px;
+}
+QScrollArea#hudContentScroll QScrollBar::handle:vertical {
+    background: rgba(100, 116, 139, 0.65);
+    border-radius: 2.5px;
+    min-height: 24px;
+}
+QScrollArea#hudContentScroll QScrollBar::handle:vertical:hover {
+    background: rgba(56, 189, 248, 0.8);
+}
+QScrollArea#hudContentScroll QScrollBar::add-line:vertical,
+QScrollArea#hudContentScroll QScrollBar::sub-line:vertical {
+    height: 0;
 }
 
 QLabel#appTitle {
     color: #f8fafc;
-    font-size: 15px;
+    font-size: 14px;
     font-weight: 800;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.8px;
 }
 
 QLabel#roundInfoText {
     color: #e2e8f0;
     font-size: 12px;
     font-weight: 700;
+    letter-spacing: 0.3px;
 }
 
 QPushButton#headerPillBtn {
     color: #cbd5e1;
-    background: rgba(30, 41, 59, 0.65);
-    border: 1px solid rgba(51, 65, 85, 0.65);
+    background: rgba(30, 41, 59, 0.70);
+    border: 1px solid rgba(71, 85, 105, 0.60);
     border-radius: 6px;
-    font-weight: bold;
+    font-weight: 700;
     font-size: 11px;
-    padding: 3px 8px;
+    padding: 3px 9px;
     min-width: 22px;
 }
 QPushButton#headerPillBtn:hover {
     color: #ffffff;
-    background: rgba(51, 65, 85, 0.85);
-    border-color: rgba(100, 116, 139, 0.8);
+    background: rgba(51, 65, 85, 0.90);
+    border-color: rgba(56, 189, 248, 0.75);
+}
+QPushButton#headerPillBtn:pressed {
+    background: rgba(20, 30, 46, 0.90);
 }
 
 QPushButton#headerCloseBtn {
     color: #94a3b8;
-    background: rgba(30, 41, 59, 0.65);
-    border: 1px solid rgba(51, 65, 85, 0.65);
+    background: rgba(30, 41, 59, 0.70);
+    border: 1px solid rgba(71, 85, 105, 0.60);
     border-radius: 6px;
     font-weight: bold;
     font-size: 13px;
-    padding: 2px 7px;
+    padding: 2px 8px;
 }
 QPushButton#headerCloseBtn:hover {
     color: #ffffff;
-    background: #e11d48;
-    border-color: #f43f5e;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #f43f5e, stop:1 #e11d48);
+    border-color: #fb7185;
 }
 
 /* Four Players Card */
 QFrame#tableCard {
-    background: rgba(19, 26, 44, 0.68);
-    border: 1px solid rgba(32, 43, 66, 0.65);
+    background: rgba(16, 22, 38, 0.75);
+    border: 1px solid rgba(45, 60, 92, 0.65);
     border-radius: 8px;
 }
 
 QLabel#playerWindBadge {
     color: #e2e8f0;
     font-size: 12px;
-    font-weight: bold;
+    font-weight: 800;
 }
 
 QLabel#riichiBadge {
     color: #ffffff;
-    background: #dc2626;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #ef4444, stop:1 #b91c1c);
+    border: 1px solid #f87171;
     border-radius: 3px;
     font-size: 9px;
-    font-weight: bold;
-    padding: 1px 3px;
+    font-weight: 800;
+    padding: 1px 4px;
 }
 
 QLabel#playerScore {
-    color: #f1f5f9;
-    font-size: 11px;
-    font-weight: bold;
-}
-
-QLabel#playerMelds {
-    color: #94a3b8;
-    font-size: 9px;
-}
-
-/* Hand Section */
-QLabel#sectionTitle {
-    color: #cbd5e1;
+    color: #f8fafc;
     font-size: 11px;
     font-weight: 700;
 }
 
+QLabel#playerMelds {
+    color: #64748b;
+    font-size: 9px;
+    font-weight: 600;
+}
+
+/* Hand Section */
+QLabel#sectionTitle {
+    color: #e2e8f0;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.3px;
+}
+
 QPushButton#ghostPillBtn {
     color: #94a3b8;
-    background: rgba(15, 23, 42, 0.5);
-    border: 1px solid rgba(42, 55, 79, 0.65);
-    border-radius: 6px;
+    background: rgba(20, 28, 46, 0.65);
+    border: 1px solid rgba(51, 65, 85, 0.6);
+    border-radius: 5px;
     font-size: 10px;
+    font-weight: 600;
     padding: 2px 8px;
 }
 QPushButton#ghostPillBtn:hover {
-    color: #f1f5f9;
-    background: rgba(30, 41, 59, 0.7);
-    border-color: #475569;
+    color: #f8fafc;
+    background: rgba(30, 42, 68, 0.85);
+    border-color: rgba(56, 189, 248, 0.65);
 }
 
 QFrame#tilesContainerCard {
-    background: rgba(19, 26, 43, 0.65);
-    border: 1px solid rgba(33, 44, 68, 0.6);
+    background: rgba(16, 22, 38, 0.72);
+    border: 1px solid rgba(42, 56, 86, 0.6);
     border-radius: 8px;
 }
 
 /* Hero Decision Card */
 QFrame#decisionHeroCard {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(18, 36, 38, 0.82), stop:1 rgba(12, 24, 26, 0.85));
-    border: 1.5px solid rgba(16, 185, 129, 0.85);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 rgba(14, 38, 38, 0.88), stop:0.5 rgba(10, 24, 28, 0.92), stop:1 rgba(7, 16, 22, 0.95));
+    border: 1.5px solid rgba(16, 185, 129, 0.78);
     border-radius: 10px;
 }
 
 QLabel#heroActionBadge {
-    color: #064e3b;
-    background: #34d399;
+    color: #022c22;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #34d399, stop:1 #10b981);
     font-size: 11px;
     font-weight: 800;
+    border: 1px solid #6ee7b7;
     border-radius: 6px;
-    padding: 3px 7px;
+    padding: 3px 8px;
 }
 
 QLabel#heroShantenLabel {
-    color: #f0fdf4;
+    color: #34d399;
     font-size: 18px;
     font-weight: 900;
 }
 
 QLabel#heroConfidencePill {
     color: #6ee7b7;
-    background: rgba(16, 185, 129, 0.25);
-    border: 1px solid #059669;
+    background: rgba(16, 185, 129, 0.18);
+    border: 1px solid rgba(16, 185, 129, 0.55);
     border-radius: 8px;
     font-size: 10px;
-    font-weight: bold;
-    padding: 2px 6px;
+    font-weight: 700;
+    padding: 2px 7px;
 }
 
 QLabel#heroDescText {
     color: #93c5fd;
     font-size: 10px;
+    font-weight: 500;
+    line-height: 1.3;
 }
 
 QLabel#dataPill {
     color: #a7f3d0;
-    background: rgba(6, 78, 59, 0.6);
-    border: 1px solid #047857;
-    border-radius: 8px;
+    background: rgba(6, 78, 59, 0.55);
+    border: 1px solid rgba(16, 185, 129, 0.45);
+    border-radius: 6px;
     font-size: 10px;
-    font-weight: bold;
-    padding: 3px 8px;
+    font-weight: 700;
+    padding: 2px 7px;
 }
 
 QLabel#heroSubText {
-    color: #cbd5e1;
+    color: #94a3b8;
     font-size: 10px;
+    font-weight: 500;
 }
 
 QLabel#heroFootnote {
     color: #64748b;
     font-size: 9px;
+    font-weight: 500;
 }
 
 /* Bottom Action Bar */
 QFrame#bottomStatusBox {
-    background: rgba(19, 25, 41, 0.65);
-    border: 1px solid rgba(30, 41, 59, 0.6);
+    background: rgba(15, 23, 42, 0.75);
+    border: 1px solid rgba(38, 52, 78, 0.65);
+    border-left: 2.5px solid #38bdf8;
     border-radius: 6px;
 }
 
 QLabel#bottomStatusTitle {
-    color: #e2e8f0;
+    color: #f1f5f9;
     font-size: 11px;
-    font-weight: bold;
+    font-weight: 700;
 }
 
 QLabel#bottomStatusSub {
     color: #38bdf8;
     font-size: 10px;
+    font-weight: 500;
 }
 
 QPushButton#hudGhostBtn {
     color: #cbd5e1;
-    background: rgba(30, 41, 59, 0.65);
-    border: 1px solid rgba(51, 65, 85, 0.65);
+    background: rgba(26, 36, 56, 0.75);
+    border: 1px solid rgba(56, 72, 100, 0.65);
     border-radius: 6px;
     font-size: 11px;
-    font-weight: bold;
-    padding: 6px 10px;
+    font-weight: 700;
+    padding: 5px 8px;
 }
 QPushButton#hudGhostBtn:hover {
     color: #ffffff;
-    background: rgba(51, 65, 85, 0.85);
-    border-color: rgba(100, 116, 139, 0.85);
+    background: rgba(45, 60, 90, 0.90);
+    border-color: rgba(56, 189, 248, 0.7);
+}
+QPushButton#hudGhostBtn:pressed {
+    background: rgba(18, 25, 40, 0.90);
 }
 
 QPushButton#hudPrimaryBtn {
     color: #022c22;
-    background: rgba(16, 185, 129, 0.90);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #10b981, stop:1 #059669);
     border: 1px solid #34d399;
     border-radius: 6px;
     font-size: 12px;
     font-weight: 800;
-    padding: 7px 14px;
+    padding: 6px 14px;
 }
 QPushButton#hudPrimaryBtn:hover {
-    background: #34d399;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #34d399, stop:1 #10b981);
     border-color: #6ee7b7;
+}
+QPushButton#hudPrimaryBtn:pressed {
+    background: #047857;
 }
 
 /* Menus */
 QMenu {
-    background: rgba(19, 26, 44, 0.95);
+    background: rgba(15, 23, 42, 0.96);
     color: #f1f5f9;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    padding: 4px;
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    border-radius: 8px;
+    padding: 5px;
 }
 QMenu::item {
     padding: 6px 20px;
-    border-radius: 4px;
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 500;
 }
 QMenu::item:selected {
-    background: #047857;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10b981);
     color: #ffffff;
+}
+QMenu::separator {
+    height: 1px;
+    background: rgba(51, 65, 85, 0.6);
+    margin: 4px 6px;
 }
 
 /* Unified Cyberpunk Dialog Styling */
 QDialog {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0f172a, stop:1 #090d16);
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0f172a, stop:0.5 #0b1120, stop:1 #080d18);
     color: #f1f5f9;
 }
 
@@ -1141,7 +1410,7 @@ QDialog QLabel {
 
 QDialog QLabel#dialogHeader {
     color: #f8fafc;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 800;
     letter-spacing: 0.5px;
 }
@@ -1155,18 +1424,74 @@ QDialog QLabel#dialogSubHeader {
 QDialog QLabel#dialogTip {
     color: #94a3b8;
     font-size: 11px;
+    line-height: 1.4;
 }
 
-QDialog QLineEdit, QDialog QComboBox, QDialog QSpinBox, QDialog QTextEdit {
-    background: rgba(15, 23, 42, 0.9);
+QDialog QFrame#dialogHeroBanner {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(15, 23, 42, 0.95), stop:1 rgba(30, 41, 59, 0.65));
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    border-bottom: 2px solid rgba(56, 189, 248, 0.5);
+    border-radius: 8px;
+}
+
+QDialog QFrame#dialogSectionCard {
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(51, 65, 85, 0.6);
+    border-radius: 8px;
+}
+
+QDialog QLabel#dialogSectionTitle {
+    color: #38bdf8;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+QDialog QFrame#dialogCalloutBox {
+    background: rgba(12, 74, 110, 0.2);
+    border: 1px solid rgba(56, 189, 248, 0.3);
+    border-left: 3px solid #38bdf8;
+    border-radius: 6px;
+}
+
+QDialog QTextEdit#terminalOutput {
+    background: #070c16;
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    border-radius: 6px;
+    font-family: "Consolas", "Cascadia Code", "Courier New", monospace;
+    font-size: 11px;
+    padding: 8px;
+    line-height: 1.4;
+}
+
+QDialog QPushButton#probeTestButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0284c7, stop:1 #0369a1);
+    color: #ffffff;
+    border: 1px solid #38bdf8;
+    font-weight: 700;
+    border-radius: 6px;
+    padding: 7px 16px;
+}
+
+QDialog QPushButton#probeTestButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #38bdf8, stop:1 #0284c7);
+    border-color: #7dd3fc;
+}
+
+QWidget#modelSettingsBody {
+    background: #0c1220;
+}
+QDialog QLineEdit, QDialog QComboBox, QDialog QSpinBox, QDialog QDoubleSpinBox, QDialog QTextEdit {
+    background: rgba(15, 23, 42, 0.85);
     color: #f8fafc;
-    border: 1px solid rgba(51, 65, 85, 0.85);
+    border: 1px solid rgba(56, 72, 100, 0.75);
     border-radius: 6px;
     padding: 6px 10px;
     font-size: 12px;
 }
 
-QDialog QLineEdit:focus, QDialog QComboBox:focus, QDialog QSpinBox:focus, QDialog QTextEdit:focus {
+QDialog QLineEdit:focus, QDialog QComboBox:focus, QDialog QSpinBox:focus, QDialog QDoubleSpinBox:focus, QDialog QTextEdit:focus {
     border: 1.5px solid #38bdf8;
     background: rgba(15, 23, 42, 0.98);
 }
@@ -1210,13 +1535,14 @@ QDialog QTabWidget::pane {
 }
 
 QDialog QTabBar::tab {
-    background: rgba(30, 41, 59, 0.6);
+    background: rgba(26, 36, 56, 0.7);
     color: #94a3b8;
     border: 1px solid rgba(51, 65, 85, 0.5);
     padding: 6px 16px;
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;
     font-weight: 600;
+    font-size: 11px;
 }
 
 QDialog QTabBar::tab:selected {
@@ -1230,7 +1556,7 @@ QDialog QPushButton {
     background: rgba(30, 41, 59, 0.85);
     border: 1px solid #475569;
     border-radius: 6px;
-    padding: 6px 14px;
+    padding: 6px 16px;
     font-size: 11px;
     font-weight: 600;
 }
@@ -1238,18 +1564,18 @@ QDialog QPushButton {
 QDialog QPushButton:hover {
     color: #ffffff;
     background: #334155;
-    border-color: #64748b;
+    border-color: rgba(56, 189, 248, 0.6);
 }
 
 QDialog QPushButton:default, QDialog QPushButton[primary="true"] {
     color: #022c22;
-    background: #10b981;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #10b981, stop:1 #059669);
     border: 1px solid #34d399;
     font-weight: 800;
 }
 
 QDialog QPushButton:default:hover, QDialog QPushButton[primary="true"]:hover {
-    background: #34d399;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #34d399, stop:1 #10b981);
     border-color: #6ee7b7;
 }
 

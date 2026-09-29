@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "Mahjong Jev Advisor Bridge",
+  "version": "0.1.3",
+  "description": "Read-only local bridge for Mahjong Soul game-state events.",
+  "host_permissions": [
+    "https://game.maj-soul.com/*",
+    "https://*.maj-soul.com/*",
+    "https://game.maj-soul.net/*",
+    "https://*.maj-soul.net/*",
+    "https://game.mahjongsoul.com/*",
+    "https://*.mahjongsoul.com/*",
+    "https://mahjongsoul.game.yo-star.com/*",
+    "https://*.yo-star.com/*",
+    "https://*.union-game.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://game.maj-soul.com/*",
+        "https://*.maj-soul.com/*",
+        "https://game.maj-soul.net/*",
+        "https://*.maj-soul.net/*",
+        "https://game.mahjongsoul.com/*",
+        "https://*.mahjongsoul.com/*",
+        "https://mahjongsoul.game.yo-star.com/*",
+        "https://*.yo-star.com/*"
+      ],
+      "js": ["page-hook.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://game.maj-soul.com/*",
+        "https://*.maj-soul.com/*",
+        "https://game.maj-soul.net/*",
+        "https://*.maj-soul.net/*",
+        "https://game.mahjongsoul.com/*",
+        "https://*.mahjongsoul.com/*",
+        "https://mahjongsoul.game.yo-star.com/*",
+        "https://*.yo-star.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [{
+    "resources": ["page-hook.js"],
+    "matches": [
+      "https://game.maj-soul.com/*",
+      "https://*.maj-soul.com/*",
+      "https://game.maj-soul.net/*",
+      "https://*.maj-soul.net/*",
+      "https://game.mahjongsoul.com/*",
+      "https://*.mahjongsoul.com/*",
+      "https://mahjongsoul.game.yo-star.com/*",
+      "https://*.yo-star.com/*"
+    ]
+  }]
+}

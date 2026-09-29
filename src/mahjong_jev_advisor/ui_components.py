@@ -11,12 +11,12 @@ Implements the high-density floating advisor layout matching the reference scree
 from __future__ import annotations
 
 from typing import Any, Callable
-from PySide6.QtCore import QPoint, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QLinearGradient, QMouseEvent, QPainter, QPen,
 )
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu, QPushButton,
+    QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QMenu, QPushButton,
     QScrollArea, QSizePolicy, QToolTip, QVBoxLayout, QWidget,
 )
 
@@ -25,26 +25,38 @@ from .ui_tiles import CompactTileBadge, MahjongTileWidget
 
 
 class DragBar(QWidget):
-    """Allows dragging the parent window from anywhere on this bar."""
+    """Secondary drag surface; the native OS caption is always available too."""
 
     def __init__(self, owner: QWidget, parent: QWidget | None = None):
         super().__init__(parent or owner)
         self.owner = owner
         self.origin: QPoint | None = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("按住标题栏拖动悬浮窗")
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self.origin = event.globalPosition().toPoint() - self.owner.pos()
+            self.origin = event.globalPosition().toPoint() - self.owner.frameGeometry().topLeft()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self.origin is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.owner.move(event.globalPosition().toPoint() - self.origin)
+            wanted = event.globalPosition().toPoint() - self.origin
+            self.owner.move(wanted)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self.origin = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        event.accept()
 
 
-class HUDTitleBar(QWidget):
+class HUDTitleBar(DragBar):
     """Top bar matching screenshot: '雀魂牌面', status pill '对局中', AI/桌/min/close buttons."""
 
     ai_clicked = Signal()
@@ -53,53 +65,65 @@ class HUDTitleBar(QWidget):
     close_clicked = Signal()
 
     def __init__(self, owner: QWidget, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.owner = owner
+        super().__init__(owner, parent)
+        self.drag_area = self
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 6)
-        layout.setSpacing(8)
+        layout.setContentsMargins(10, 8, 10, 4)
+        layout.setSpacing(6)
 
-        # Draggable title area
-        self.drag_area = DragBar(owner, self)
-        drag_layout = QHBoxLayout(self.drag_area)
-        drag_layout.setContentsMargins(0, 0, 0, 0)
-        drag_layout.setSpacing(6)
+        # Title branding with cyan accent indicator
+        title_box = QHBoxLayout()
+        title_box.setSpacing(6)
+
+        dot = QLabel("◆")
+        dot.setStyleSheet("color: #38bdf8; font-size: 9px;")
+        dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        title_box.addWidget(dot)
 
         self.title_label = QLabel("雀魂牌面")
         self.title_label.setObjectName("appTitle")
         self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        drag_layout.addWidget(self.title_label)
+        title_box.addWidget(self.title_label)
+        layout.addLayout(title_box)
 
-        drag_layout.addStretch()
-        layout.addWidget(self.drag_area, 1)
+        layout.addStretch()
 
         # Status capsule e.g. 【对局中】 / 【待机中】
         self.status_pill = QLabel("对局中")
         self.status_pill.setObjectName("statusPill")
+        self.status_pill.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.status_pill.setStyleSheet(
+            "color: #34d399; background: rgba(16, 185, 129, 0.16); border: 1px solid rgba(16, 185, 129, 0.45); "
+            "border-radius: 9px; padding: 2px 9px; font-weight: 700; font-size: 11px;"
+        )
         layout.addWidget(self.status_pill)
 
         # Action buttons: AI, 桌, -, x
         self.btn_ai = QPushButton("AI")
         self.btn_ai.setObjectName("headerPillBtn")
         self.btn_ai.setToolTip("AI建议 / Jev设置 / 大模型设置")
+        self.btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_ai.clicked.connect(self.ai_clicked.emit)
         layout.addWidget(self.btn_ai)
 
         self.btn_table = QPushButton("桌")
         self.btn_table.setObjectName("headerPillBtn")
         self.btn_table.setToolTip("牌桌选择与校准工具")
+        self.btn_table.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_table.clicked.connect(self.table_clicked.emit)
         layout.addWidget(self.btn_table)
 
         self.btn_min = QPushButton("−")
         self.btn_min.setObjectName("headerPillBtn")
         self.btn_min.setToolTip("最小化")
+        self.btn_min.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_min.clicked.connect(self.minimize_clicked.emit)
         layout.addWidget(self.btn_min)
 
         self.btn_close = QPushButton("×")
         self.btn_close.setObjectName("headerCloseBtn")
         self.btn_close.setToolTip("关闭")
+        self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_close.clicked.connect(self.close_clicked.emit)
         layout.addWidget(self.btn_close)
 
@@ -108,18 +132,18 @@ class HUDTitleBar(QWidget):
         self.status_pill.setText(text)
         if state == "active":
             self.status_pill.setStyleSheet(
-                "color: #10b981; background: rgba(16, 185, 129, 0.18); border: 1px solid #059669; "
-                "border-radius: 10px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
+                "color: #34d399; background: rgba(16, 185, 129, 0.16); border: 1px solid rgba(16, 185, 129, 0.45); "
+                "border-radius: 9px; padding: 2px 9px; font-weight: 700; font-size: 11px;"
             )
         elif state == "warning":
             self.status_pill.setStyleSheet(
-                "color: #fbbf24; background: rgba(245, 158, 11, 0.18); border: 1px solid #d97706; "
-                "border-radius: 10px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
+                "color: #fbbf24; background: rgba(245, 158, 11, 0.16); border: 1px solid rgba(245, 158, 11, 0.45); "
+                "border-radius: 9px; padding: 2px 9px; font-weight: 700; font-size: 11px;"
             )
         else:
             self.status_pill.setStyleSheet(
-                "color: #94a3b8; background: rgba(71, 85, 105, 0.25); border: 1px solid #475569; "
-                "border-radius: 10px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
+                "color: #94a3b8; background: rgba(71, 85, 105, 0.22); border: 1px solid rgba(100, 116, 139, 0.35); "
+                "border-radius: 9px; padding: 2px 9px; font-weight: 700; font-size: 11px;"
             )
 
 
@@ -129,7 +153,7 @@ class RoundInfoBar(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 4, 14, 6)
+        layout.setContentsMargins(12, 2, 12, 4)
         layout.setSpacing(6)
 
         self.round_text = QLabel("东1局  ·  余 29  ·  3北")
@@ -138,16 +162,23 @@ class RoundInfoBar(QWidget):
 
         layout.addStretch()
 
-        # Dora label + mini tile
-        dora_box = QHBoxLayout()
-        dora_box.setSpacing(4)
+        # Dora container card: amber golden framing
+        dora_frame = QFrame()
+        dora_frame.setStyleSheet(
+            "background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.28); "
+            "border-radius: 6px; padding: 1px 5px;"
+        )
+        dora_box = QHBoxLayout(dora_frame)
+        dora_box.setContentsMargins(0, 0, 0, 0)
+        dora_box.setSpacing(5)
+
         lbl = QLabel("宝")
-        lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+        lbl.setStyleSheet("color: #fbbf24; font-size: 11px; font-weight: 800;")
         dora_box.addWidget(lbl)
 
         self.dora_tile = MahjongTileWidget(tile="", width=17, height=23, show_code=False)
         dora_box.addWidget(self.dora_tile)
-        layout.addLayout(dora_box)
+        layout.addWidget(dora_frame)
 
     def set_round_info(
         self,
@@ -182,9 +213,10 @@ class PlayerRiverRow(QWidget):
 
     def __init__(self, wind_name: str, parent: QWidget | None = None):
         super().__init__(parent)
+        self.setFixedHeight(26)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(6)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(5)
 
         # Wind & Riichi indicator
         left_box = QHBoxLayout()
@@ -202,7 +234,7 @@ class PlayerRiverRow(QWidget):
         # Score & Melds info
         info_col = QVBoxLayout()
         info_col.setContentsMargins(0, 0, 0, 0)
-        info_col.setSpacing(1)
+        info_col.setSpacing(0)
 
         self.score_label = QLabel("25,000")
         self.score_label.setObjectName("playerScore")
@@ -216,7 +248,7 @@ class PlayerRiverRow(QWidget):
         # River compact tiles strip
         self.river_container = QWidget()
         self.river_layout = QHBoxLayout(self.river_container)
-        self.river_layout.setContentsMargins(4, 0, 0, 0)
+        self.river_layout.setContentsMargins(2, 0, 0, 0)
         self.river_layout.setSpacing(3)
         self.river_layout.addStretch()
         layout.addWidget(self.river_container, 1)
@@ -264,8 +296,8 @@ class FourPlayersRiverWidget(QFrame):
         super().__init__(parent)
         self.setObjectName("tableCard")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(6, 3, 6, 3)
+        layout.setSpacing(2)
 
         self.rows: list[PlayerRiverRow] = []
         winds = ["东", "南", "西", "北"]
@@ -289,10 +321,10 @@ class FourPlayersRiverWidget(QFrame):
             m_list = melds[i] if i < len(melds) else []
             meld_text = f"副露×{len(m_list)}" if m_list else "门清"
             if i == my_seat:
-                # Highlight current player wind
-                self.rows[i].wind_label.setStyleSheet("color: #facc15; font-weight: 800; font-size: 13px;")
+                # Highlight current player wind with luminous gold
+                self.rows[i].wind_label.setStyleSheet("color: #fde047; font-weight: 800; font-size: 13px;")
             else:
-                self.rows[i].wind_label.setStyleSheet("color: #cbd5e1; font-weight: 700; font-size: 12px;")
+                self.rows[i].wind_label.setStyleSheet("color: #94a3b8; font-weight: 700; font-size: 12px;")
 
             self.rows[i].update_row(score, is_riichi, meld_text, r_tiles)
 
@@ -306,11 +338,14 @@ class HandWidget(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 4, 10, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setSpacing(3)
 
         # Header: '手牌 14' and '隐藏四家' toggle button
         header = QHBoxLayout()
+        header.setContentsMargins(2, 0, 2, 0)
+        header.setSpacing(6)
+
         self.count_label = QLabel("手牌 14")
         self.count_label.setObjectName("sectionTitle")
         header.addWidget(self.count_label)
@@ -327,19 +362,19 @@ class HandWidget(QWidget):
         self.tiles_card = QFrame()
         self.tiles_card.setObjectName("tilesContainerCard")
         tiles_layout = QHBoxLayout(self.tiles_card)
-        tiles_layout.setContentsMargins(6, 6, 6, 6)
-        tiles_layout.setSpacing(2)
+        tiles_layout.setContentsMargins(4, 4, 4, 4)
+        tiles_layout.setSpacing(0)
 
         # Hand tiles (up to 13)
         self.hand_slots: list[MahjongTileWidget] = []
         for _ in range(13):
-            slot = MahjongTileWidget(tile="", width=23, height=33, show_code=True)
+            slot = MahjongTileWidget(tile="", width=18, height=26, show_code=True)
             slot.clicked.connect(self._on_tile_clicked)
             self.hand_slots.append(slot)
             tiles_layout.addWidget(slot)
 
         # Gap before drawn tile
-        tiles_layout.addSpacing(10)
+        tiles_layout.addSpacing(6)
 
         # Draw tile container with '摸' indicator
         draw_col = QVBoxLayout()
@@ -347,18 +382,31 @@ class HandWidget(QWidget):
         draw_col.setSpacing(1)
 
         draw_header = QHBoxLayout()
+        draw_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         draw_lbl = QLabel("摸")
-        draw_lbl.setStyleSheet("color: #10b981; font-size: 9px; font-weight: bold;")
+        draw_lbl.setStyleSheet(
+            "color: #34d399; font-size: 9px; font-weight: 800; "
+            "background: rgba(16, 185, 129, 0.16); border-radius: 3px; padding: 0 4px;"
+        )
         draw_header.addWidget(draw_lbl)
         draw_col.addLayout(draw_header)
 
-        self.draw_slot = MahjongTileWidget(tile="", width=23, height=33, show_code=True)
+        self.draw_slot = MahjongTileWidget(tile="", width=18, height=26, show_code=True)
         self.draw_slot.clicked.connect(self._on_tile_clicked)
         draw_col.addWidget(self.draw_slot)
         tiles_layout.addLayout(draw_col)
 
         tiles_layout.addStretch()
         layout.addWidget(self.tiles_card)
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        card_width = self.tiles_card.width()
+        tile_width = min(23, max(14, (card_width - 18) // 14 - 6))
+        if self.hand_slots[0].tile_w != tile_width:
+            tile_height = round(tile_width * 1.43)
+            for slot in [*self.hand_slots, self.draw_slot]:
+                slot.set_tile_size(tile_width, tile_height, show_code=tile_width >= 17)
 
     def _on_tile_clicked(self, tile: str) -> None:
         if tile:
@@ -417,7 +465,7 @@ class ProbabilityBarItem(QWidget):
         self.percent = max(0, min(100, percent))
         self.is_top = is_top
         self.bar_color = bar_color or (QColor("#10b981") if is_top else QColor("#8b5cf6"))
-        self.setFixedHeight(18)
+        self.setFixedHeight(16)
 
     def paintEvent(self, event: Any) -> None:
         painter = QPainter(self)
@@ -430,32 +478,39 @@ class ProbabilityBarItem(QWidget):
         font = painter.font()
         font.setPointSize(9)
         font.setBold(self.is_top)
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
         painter.setFont(font)
-        painter.setPen(QColor("#f1f5f9") if self.is_top else QColor("#cbd5e1"))
+        painter.setPen(QColor("#34d399") if self.is_top else QColor("#cbd5e1"))
         label_rect = QRectF(2, 0, 36, h)
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.label)
 
-        # Bar track
+        # Bar track: sleek dark frosted channel
         bar_x = 42.0
         bar_w = w - bar_x - 42.0
-        bar_rect = QRectF(bar_x, h * 0.28, bar_w, h * 0.44)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor(30, 41, 59, 160)))
-        painter.drawRoundedRect(bar_rect, 3.0, 3.0)
+        bar_rect = QRectF(bar_x, h * 0.26, bar_w, h * 0.48)
+        painter.setPen(QPen(QColor(42, 54, 80, 160), 0.8))
+        painter.setBrush(QBrush(QColor(18, 24, 38, 200)))
+        painter.drawRoundedRect(bar_rect, 3.5, 3.5)
 
-        # Bar fill with glow
+        # Bar fill with radiant gradient
         fill_w = max(4.0, bar_w * (self.percent / 100.0)) if self.percent > 0 else 0
         if fill_w > 0:
-            fill_rect = QRectF(bar_x, h * 0.28, fill_w, h * 0.44)
+            fill_rect = QRectF(bar_x, h * 0.26, fill_w, h * 0.48)
             grad = QLinearGradient(fill_rect.topLeft(), fill_rect.topRight())
             if self.is_top:
-                grad.setColorAt(0.0, QColor("#10b981"))
+                grad.setColorAt(0.0, QColor("#059669"))
                 grad.setColorAt(1.0, QColor("#34d399"))
             else:
-                grad.setColorAt(0.0, self.bar_color)
-                grad.setColorAt(1.0, self.bar_color.lighter(120))
+                grad.setColorAt(0.0, self.bar_color.darker(120))
+                grad.setColorAt(1.0, self.bar_color.lighter(115))
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(grad))
-            painter.drawRoundedRect(fill_rect, 3.0, 3.0)
+            painter.drawRoundedRect(fill_rect, 3.5, 3.5)
+
+            # Top highlight sheen
+            sheen_pen = QPen(QColor(255, 255, 255, 80), 0.7)
+            painter.setPen(sheen_pen)
+            painter.drawLine(fill_rect.topLeft() + QPointF(2, 1), fill_rect.topRight() - QPointF(2, -1))
 
         # Percentage text
         pct_rect = QRectF(w - 38, 0, 36, h)
@@ -472,8 +527,8 @@ class DecisionHeroCard(QFrame):
         super().__init__(parent)
         self.setObjectName("decisionHeroCard")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(4)
 
         # Header line: [AI 切牌] pill, Large glowing tile [1p], Big text "2向听", "置信 78%"
         top_row = QHBoxLayout()
@@ -483,12 +538,12 @@ class DecisionHeroCard(QFrame):
         self.action_badge.setObjectName("heroActionBadge")
         top_row.addWidget(self.action_badge)
 
-        self.hero_tile = MahjongTileWidget(tile="", width=34, height=48, show_code=True, glowing=True)
+        self.hero_tile = MahjongTileWidget(tile="", width=32, height=44, show_code=True, glowing=True)
         top_row.addWidget(self.hero_tile)
 
         shanten_box = QVBoxLayout()
         shanten_box.setContentsMargins(0, 0, 0, 0)
-        shanten_box.setSpacing(2)
+        shanten_box.setSpacing(1)
 
         shanten_line = QHBoxLayout()
         shanten_line.setSpacing(6)
@@ -513,15 +568,15 @@ class DecisionHeroCard(QFrame):
         # Probability bars list
         self.bars_container = QWidget()
         self.bars_layout = QVBoxLayout(self.bars_container)
-        self.bars_layout.setContentsMargins(0, 4, 0, 4)
-        self.bars_layout.setSpacing(3)
+        self.bars_layout.setContentsMargins(0, 1, 0, 1)
+        self.bars_layout.setSpacing(2)
         layout.addWidget(self.bars_container)
 
-        # Data Pills: 【弃和 28%】 【风险分 1.03】 【摸切 6】 【副露 2】
+        # Data Pills: 【防守倾向 28/100】 【风险分 1.03】 【摸切 6】 【副露 2】
         self.pills_row = QHBoxLayout()
-        self.pills_row.setSpacing(6)
+        self.pills_row.setSpacing(4)
 
-        self.pill_fold = QLabel("弃和 28%")
+        self.pill_fold = QLabel("防守倾向 —")
         self.pill_fold.setObjectName("dataPill")
         self.pills_row.addWidget(self.pill_fold)
 
@@ -539,15 +594,13 @@ class DecisionHeroCard(QFrame):
 
         self.pill_yaku = QLabel("")
         self.pill_yaku.setObjectName("dataPill")
-        self.pill_yaku.setStyleSheet("background-color: rgba(139, 92, 246, 0.25); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.4);")
+        self.pill_yaku.setStyleSheet("background-color: rgba(139, 92, 246, 0.22); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.4);")
         self.pills_row.addWidget(self.pill_yaku)
 
         self.pills_row.addStretch()
         layout.addLayout(self.pills_row)
 
-        # Explanatory lines:
-        # "Jev 选择概率 0.83, 置信度 0.78"
-        # "风险 放铳风险 1.03 (confidence 0.38)"
+        # Explanatory lines
         self.stats_line_1 = QLabel("Jev 选择概率 0.83, 置信度 0.78")
         self.stats_line_1.setObjectName("heroSubText")
         layout.addWidget(self.stats_line_1)
@@ -560,7 +613,7 @@ class DecisionHeroCard(QFrame):
         self.alt_row = QHBoxLayout()
         self.alt_row.setSpacing(6)
         alt_label = QLabel("次选")
-        alt_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        alt_label.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 700;")
         self.alt_row.addWidget(alt_label)
 
         self.alt_badges_layout = QHBoxLayout()
@@ -569,8 +622,8 @@ class DecisionHeroCard(QFrame):
         self.alt_row.addStretch()
         layout.addLayout(self.alt_row)
 
-        # Source footnote: "来源：Jev · 校准概率可视化"
-        self.source_label = QLabel("来源：Jev · 校准概率可视化")
+        # Source footnote identifies the model and the meaning of its probabilities.
+        self.source_label = QLabel("来源：Vercel Jev · 选择概率")
         self.source_label.setObjectName("heroFootnote")
         self.source_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.source_label)
@@ -587,24 +640,33 @@ class DecisionHeroCard(QFrame):
         draw_info: str = "摸切",
         melds_count: int = 0,
         alternatives: list[str] | None = None,
-        source_note: str = "Jev · 校准概率可视化",
+        source_note: str = "Vercel Jev · 选择概率",
         raw_detail: str = "",
         yaku_badge: str = "",
+        probability_label: str = "Jev 选择概率",
     ) -> None:
         self.rec_tile = rec_tile
         self.action_badge.setText(f"AI {action_name}")
         self.hero_tile.set_tile(rec_tile, glowing=bool(rec_tile))
+        self.hero_tile.setVisible(bool(rec_tile))
 
         if shanten_num is not None:
             if shanten_num == 0:
                 self.shanten_label.setText("听牌")
+                self.shanten_label.setStyleSheet("color: #fde047; font-size: 18px; font-weight: 900;")
+            elif shanten_num == 1:
+                self.shanten_label.setText(f"{shanten_num}向听")
+                self.shanten_label.setStyleSheet("color: #38bdf8; font-size: 18px; font-weight: 900;")
             else:
                 self.shanten_label.setText(f"{shanten_num}向听")
+                self.shanten_label.setStyleSheet("color: #34d399; font-size: 18px; font-weight: 900;")
         else:
-            self.shanten_label.setText("决策中")
+            self.shanten_label.setText("等待决策")
+            self.shanten_label.setStyleSheet("color: #94a3b8; font-size: 18px; font-weight: 900;")
 
-        conf_str = f"置信 {int(confidence * 100)}%" if confidence is not None else "确定规则"
+        conf_str = f"置信 {int(confidence * 100)}%" if confidence is not None else "未提供置信度"
         self.confidence_pill.setText(conf_str)
+        self.confidence_pill.setVisible(bool(rec_tile))
 
         if raw_detail:
             self.hero_desc.setText(raw_detail)
@@ -621,17 +683,14 @@ class DecisionHeroCard(QFrame):
             for label, pct, is_top in probabilities:
                 bar = ProbabilityBarItem(label, pct, is_top=is_top)
                 self.bars_layout.addWidget(bar)
-        else:
-            # Fallback placeholder if no probabilities
-            if rec_tile:
-                bar = ProbabilityBarItem(rec_tile, 85, is_top=True)
-                self.bars_layout.addWidget(bar)
 
         # Data pills
-        self.pill_fold.setText(f"弃和 {fold_rate}%")
+        self.pill_fold.setText(f"防守倾向 {fold_rate}/100")
         self.pill_danger.setText(f"风险分 {danger_score:.2f}")
         self.pill_draw_status.setText(draw_info)
         self.pill_melds.setText(f"副露 {melds_count}")
+        for pill in (self.pill_fold, self.pill_danger, self.pill_draw_status, self.pill_melds):
+            pill.setVisible(bool(rec_tile))
         if yaku_badge:
             self.pill_yaku.setText(yaku_badge)
             self.pill_yaku.show()
@@ -639,10 +698,15 @@ class DecisionHeroCard(QFrame):
             self.pill_yaku.hide()
 
         # Update detailed stats
-        prob_val = probabilities[0][1] / 100.0 if probabilities else 0.80
-        conf_val = confidence if confidence is not None else 0.85
-        self.stats_line_1.setText(f"Jev 选择概率 {prob_val:.2f}, 置信度 {conf_val:.2f}")
-        self.stats_line_2.setText(f"风险 放铳风险 {danger_score:.2f} (confidence {conf_val * 0.5:.2f})")
+        if not rec_tile:
+            self.stats_line_1.setText("等待可用的决策结果")
+            self.stats_line_2.setText("")
+        else:
+            selected = next((pct for _, pct, top in probabilities if top), None)
+            probability_text = f"{probability_label} {selected / 100:.2f}" if selected is not None else "模型未提供概率"
+            confidence_text = f"置信度 {confidence:.2f}" if confidence is not None else "未提供置信度"
+            self.stats_line_1.setText(f"{probability_text} · {confidence_text}")
+            self.stats_line_2.setText(f"本地规则相对风险分 {danger_score:.2f}")
 
         # Alternatives badges
         while self.alt_badges_layout.count() > 0:
@@ -677,21 +741,21 @@ class BottomActionBar(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 4, 12, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 2, 8, 4)
+        layout.setSpacing(3)
 
-        # Status note line: "AI 建议 Jev jev-latest · 桥OK \n 切 1p · 置信 78% · 弃和 28%"
+        # Status note line summarizes the selected model and action.
         self.status_box = QFrame()
         self.status_box.setObjectName("bottomStatusBox")
         box_layout = QVBoxLayout(self.status_box)
-        box_layout.setContentsMargins(8, 6, 8, 6)
-        box_layout.setSpacing(2)
+        box_layout.setContentsMargins(8, 3, 8, 3)
+        box_layout.setSpacing(1)
 
-        self.status_title = QLabel("AI 建议 Jev jev-latest · 桥OK")
+        self.status_title = QLabel("AI 建议 Vercel Jev · 待连接")
         self.status_title.setObjectName("bottomStatusTitle")
         box_layout.addWidget(self.status_title)
 
-        self.status_summary = QLabel("切 1p  ·  置信 78%  ·  弃和 28%")
+        self.status_summary = QLabel("等待牌局与模型连接")
         self.status_summary.setObjectName("bottomStatusSub")
         box_layout.addWidget(self.status_summary)
 
@@ -699,7 +763,7 @@ class BottomActionBar(QWidget):
 
         # Main button bar: [AI建议] [深度解析] [清空] [Jev设置] [大模型设置]
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(5)
+        btn_row.setSpacing(3)
 
         self.btn_ai = QPushButton("AI建议")
         self.btn_ai.setObjectName("hudGhostBtn")
@@ -731,7 +795,7 @@ class BottomActionBar(QWidget):
 
         # Secondary row: [开始识别] [手动核对]
         sec_row = QHBoxLayout()
-        sec_row.setSpacing(6)
+        sec_row.setSpacing(5)
 
         self.btn_toggle = QPushButton("开始识别")
         self.btn_toggle.setObjectName("hudPrimaryBtn")

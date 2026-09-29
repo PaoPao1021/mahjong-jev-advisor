@@ -32,7 +32,7 @@ class GameState:
     def validate(self) -> None:
         if len(self.rivers) != 4 or len(self.melds) != 4 or len(self.scores) != 4 or len(self.riichi) != 4:
             raise ValueError("A four-player state needs four rivers, meld sets, scores and riichi flags")
-        if not 0 <= self.seat < 4 or self.round_wind not in "ES?" or self.seat_wind not in "ESWN?":
+        if not 0 <= self.seat < 4 or self.round_wind not in {"E", "S", "?"} or self.seat_wind not in {"E", "S", "W", "N", "?"}:
             raise ValueError("Invalid seat or wind")
         if self.round_number is not None and not 1 <= self.round_number <= 4:
             raise ValueError("Round number must be from 1 to 4")
@@ -50,8 +50,9 @@ class GameState:
         for tile in all_tiles:
             if not valid(tile):
                 raise ValueError(f"Invalid tile: {tile}")
-        # A physical copy may appear both in the discard river and in a meld after a call.
-        validate_physical_tiles(list(self.hand) + list(self.dora_indicators))
+        # Called tiles are moved from the river into the meld by the state
+        # reconstructor, so every visible physical tile is counted once.
+        validate_physical_tiles(all_tiles)
         if self.last_discard is not None and not valid(self.last_discard):
             raise ValueError("Invalid last discard")
         if self.hand:
@@ -78,7 +79,7 @@ class GameState:
             round_number=int(data["round_number"]) if data.get("round_number") is not None else None,
             seat_wind=str(data.get("seat_wind", "?")).upper(),
             scores=tuple(int(x) if x is not None else None for x in data.get("scores", [None] * 4)),
-            riichi=tuple(None if x is None else bool(x) for x in data.get("riichi", [None] * 4)),
+            riichi=tuple(data.get("riichi", [None] * 4)),
             honba=int(data.get("honba", 0)),
             sticks=int(data.get("sticks", 0)),
             open_melds=int(data.get("open_melds", 0)),

@@ -11,7 +11,7 @@ from mahjong_jev_advisor.llm import (
     LLMAuthError, LLMError, _format_state_prompt, query_llm_analysis,
 )
 from mahjong_jev_advisor.rules import (
-    _call_yaku_available, _chi_options, candidates, danger,
+    UncertainState, _call_yaku_available, _chi_options, candidates, danger,
     dora_from_indicator, shanten_text, ukeire_details,
 )
 from mahjong_jev_advisor.settings import Settings
@@ -112,17 +112,15 @@ def test_call_yaku_rejected_when_tanyao_broken_by_existing_melds():
     assert _call_yaku_available(state, cand_chi) is False
 
 
-def test_chi_options_fallback_preserves_chi_candidate():
+def test_chi_options_rejects_impossible_combination():
     # Last discard is 3m, but hand doesn't have 1m2m, 2m4m, or 4m5m
     state = make_state(
         hand="123p456p789s11z55z",
         buttons=["chi", "pass"],
         last_discard="3m",
     )
-    opts = _chi_options(state)
-    assert len(opts) == 1
-    assert opts[0].action == "chi"
-    assert opts[0].tile == "3m"
+    with pytest.raises(UncertainState):
+        _chi_options(state)
 
 
 def test_template_store_batch_matching(tmp_path):
@@ -312,4 +310,3 @@ def test_candidates_populates_expected_han_and_potential_yaku():
     assert discard_9p.expected_han is not None and discard_9p.expected_han >= 1
     assert "门清自摸" in discard_9p.potential_yaku or "平和" in discard_9p.potential_yaku
     assert "预计" in discard_9p.rationale
-

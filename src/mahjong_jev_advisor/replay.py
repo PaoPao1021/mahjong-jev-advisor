@@ -22,7 +22,7 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
-from .jev import advise
+from .jev import JevError, advise
 from .rules import NoDecision, UncertainState, candidates, local_choice
 from .settings import Settings
 from .state import Advice, GameState
@@ -68,7 +68,7 @@ def main() -> None:
     if args.frames and not settings.regions:
         parser.error("Calibrate regions in the app before replaying screenshots")
     if args.online and not settings.api_key:
-        parser.error("--online requires a TypeSafe API Key in Settings or TYPESAFE_API_KEY")
+        parser.error("--online requires an API Key for the selected provider in Settings")
     truth = {}
     if args.truth:
         for line in args.truth.read_text(encoding="utf-8").splitlines():
@@ -85,7 +85,7 @@ def main() -> None:
     for name, state, problems in source_rows:
         started = time.perf_counter()
         row: dict = {"frame": name, "problems": problems}
-        if state:
+        if state and not problems:
             row["state"] = state.to_dict()
             if name in truth:
                 expected = truth[name]
@@ -96,15 +96,16 @@ def main() -> None:
             try:
                 options = candidates(state)
                 if args.online:
-                    advice = advise(state, options, settings.api_key)
+                    advice = advise(state, options, settings.api_key, connection=settings.connection())
                 else:
                     selected = local_choice(options, state)
                     advice = Advice(selected, tuple(x for x in options if x != selected)[:3], source="rules")
                 row["advice"] = advice.to_dict()
-            except (NoDecision, UncertainState) as error:
+            except (NoDecision, UncertainState, JevError) as error:
                 row["problems"].append(str(error))
         row["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
         latencies.append(row["latency_ms"])
+        results.append(row)
         try:
             print(json.dumps(row, ensure_ascii=False))
         except UnicodeEncodeError:

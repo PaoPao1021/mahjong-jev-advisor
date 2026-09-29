@@ -138,6 +138,8 @@ class TemplateStore:
         return results[0] if results else TileMatch(None, 0.0, True)
 
     def match_batch(self, images: list[np.ndarray]) -> list[TileMatch]:
+        if not images:
+            return []
         if not self.samples or self._matrix is None or len(self._matrix) == 0:
             return [TileMatch(None, 0.0, True) for _ in images]
 
@@ -187,6 +189,85 @@ def region_cells(frame: np.ndarray, rect: tuple[float, float, float, float], col
     ]
 
 
+def detect_basic_regions(frame: np.ndarray) -> dict[str, tuple[float, float, float, float]]:
+    """Detect the standard Mahjong Soul hand strip and derive live input regions.
+
+    The browser game scales its 16:9 canvas uniformly.  The hand itself is a much
+    stronger anchor than absolute pixels: thirteen light tile faces form one long
+    contour at the bottom of the canvas.  No screenshot is saved by this routine.
+    """
+    if frame.size == 0 or frame.ndim != 3:
+        return {}
+    height, width = frame.shape[:2]
+    if width < 640 or height < 360 or width / height < 1.35:
+        return {}
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # Includes pale tile faces while excluding the blue table and orange tile backs.
+    mask = cv2.inRange(hsv, (0, 0, 125), (179, 210, 255))
+    mask[:round(height * 0.68)] = 0
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(5, round(width / 220)), max(7, round(height / 80)))
+    )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    choices: list[tuple[float, tuple[int, int, int, int]]] = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if (y >= height * 0.68 and width * 0.38 <= w <= width * 0.82
+                and height * 0.075 <= h <= height * 0.22 and w / max(h, 1) >= 5.0):
+            fill = cv2.contourArea(contour) / max(1, w * h)
+            if fill >= 0.48:
+                choices.append((w * h * fill, (x, y, w, h)))
+    if not choices:
+        return {}
+    _, (x, y, hand_w, hand_h) = max(choices, key=lambda item: item[0])
+    slot_w = hand_w / 13.0
+    if not 0.35 <= slot_w / hand_h <= 0.9:
+        return {}
+    draw_x = min(width - slot_w, x + hand_w + max(3, width * 0.006))
+
+    def norm(px: float, py: float, pw: float, ph: float):
+        return (max(0.0, px / width), max(0.0, py / height),
+                min(1.0 - px / width, pw / width), min(1.0 - py / height, ph / height))
+
+    return {
+        "hand": norm(x, y, hand_w, hand_h),
+        "draw": norm(draw_x, y, slot_w, hand_h),
+        # Mahjong Soul keeps action buttons in this stable central-bottom band.
+        "buttons": (0.40, 0.62, 0.48, 0.25),
+        # The upper-left five-slot dora rack is also stable on the common web layout.
+        "dora": (0.010, 0.040, 0.145, 0.095),
+    }
+
+
+def learn_templates_from_state(frame: np.ndarray, regions: dict[str, tuple[float, float, float, float]],
+                               state: GameState, store: TemplateStore) -> int:
+    """Use a verified manual state once to label the current on-screen tile crops."""
+    saved = 0
+    concealed_count = 13 - 3 * state.open_melds
+    hand_labels = list(state.hand[:concealed_count])
+    draw_labels = list(state.hand[concealed_count:])
+    if "hand" in regions:
+        hand_cells = region_cells(frame, regions["hand"], 13, 1)
+        for label, cell in zip(hand_labels, hand_cells):
+            if cell.size:
+                store.add(label, cell)
+                saved += 1
+    if "draw" in regions:
+        draw_cells = region_cells(frame, regions["draw"], 1, 1)
+        if draw_cells and draw_cells[0].size:
+            store.add(draw_labels[0] if draw_labels else "empty", draw_cells[0])
+            saved += 1
+    if "dora" in regions and state.dora_indicators:
+        dora_cells = region_cells(frame, regions["dora"], 5, 1)
+        for index, cell in enumerate(dora_cells):
+            if cell.size:
+                label = state.dora_indicators[index] if index < len(state.dora_indicators) else "empty"
+                store.add(label, cell)
+                saved += 1
+    return saved
+
+
 BUTTON_WORDS = {
     "ron": ("荣和", "榮和", "ロン", "ron"),
     "tsumo": ("自摸", "ツモ", "tsumo"),
@@ -194,7 +275,7 @@ BUTTON_WORDS = {
     "chi": ("吃", "チー", "chi"),
     "pon": ("碰", "ポン", "pon"),
     "kan": ("杠", "槓", "カン", "kan"),
-    "pass": ("过", "過", "パス", "pass"),
+    "pass": ("过", "過", "跳遇", "パス", "pass"),
     "kyuushu": ("九种九牌", "九種九牌"),
 }
 
@@ -204,6 +285,8 @@ def parse_buttons(text: str, self_draw: bool | None = None) -> frozenset[str]:
     found = {key for key, words in BUTTON_WORDS.items() if any(word.lower() in lower for word in words)}
     if "和" in lower and not found & {"ron", "tsumo"} and self_draw is not None:
         found.add("tsumo" if self_draw else "ron")
+    if found & {"chi", "pon", "kan", "ron"}:
+        found.add("pass")
     return frozenset(found)
 
 
@@ -239,7 +322,15 @@ class VisionReader:
         result, _ = self._ocr(image)
         if not result:
             return "", 0.0
-        return " ".join(item[1] for item in result), min(float(item[2]) for item in result)
+        text = " ".join(item[1] for item in result)
+        action_scores = [
+            float(item[2]) for item in result
+            if any(word.lower() in item[1].lower() for words in BUTTON_WORDS.values() for word in words)
+        ]
+        # Timers and decorative text often share this crop. Their OCR score must not
+        # make a correctly recognized action button look uncertain.
+        scores = action_scores or [float(item[2]) for item in result]
+        return text, min(scores)
 
     def _ocr_sections(self, frame: np.ndarray, names: list[str]) -> dict[str, str]:
         available = [(name, crop_region(frame, self.regions[name])) for name in names if name in self.regions]
@@ -292,6 +383,10 @@ class VisionReader:
         return tiles, min(confidences, default=0.0), unknown
 
     def analyze(self, frame: np.ndarray, seat: int = 0) -> Observation:
+        # Commit temporal state only after the complete frame passes validation.
+        history = (self._previous_rivers, self._last_discard, list(self._riichi_latched),
+                   list(self._last_scores), self._last_round_wind, self._last_round_number,
+                   self._last_honba, self._last_meta_scan)
         problems: list[str] = []
         debug: dict[str, Any] = {}
         missing = [name for name, _, _, _, required in REGIONS if required and name not in self.regions]
@@ -325,7 +420,7 @@ class VisionReader:
         button_text, button_conf = self._ocr_text(button_image)
         buttons = parse_buttons(button_text, len(own_hand) == 14 - 3 * own_melds)
         debug["button_text"] = button_text
-        if buttons and button_conf < 0.80:
+        if buttons and button_conf < 0.70:
             problems.append("操作按钮 OCR 置信度不足")
         now = time.monotonic()
         if now - self._last_meta_scan >= 10.0:
@@ -357,21 +452,35 @@ class VisionReader:
             key = f"riichi_{i}"
             if key in self.regions:
                 riichi[i] = bool(riichi[i]) or self._riichi_stick_present(crop_region(frame, self.regions[key]))
-        confidence = min([hand_conf] + other_confidences) if hand else 0.0
+        confidence = min([hand_conf] + ([draw_conf] if draw else []) + other_confidences) if hand else 0.0
         if not hand:
             problems.append("未识别到手牌")
         if problems:
             confidence = min(confidence, 0.5)
         river_tuple = tuple(tuple(x) for x in rivers)
         if self._previous_rivers:
-            if sum(map(len, river_tuple)) < sum(map(len, self._previous_rivers)):
+            if sum(map(len, river_tuple)) == 0 and sum(map(len, self._previous_rivers)) > 0:
                 self._last_discard = None
+                self._last_round_wind = "?"
                 self._last_round_number = None
+                self._last_honba = 0
+                self._last_scores = [None] * 4
                 riichi = [None if f"riichi_{i}" not in self.regions else False for i in range(4)]
                 self._last_meta_scan = 0.0
-            for i in range(4):
-                if len(river_tuple[i]) > len(self._previous_rivers[i]):
-                    self._last_discard = river_tuple[i][-1]
+            else:
+                changed = [i for i in range(4) if river_tuple[i] != self._previous_rivers[i]]
+                if len(changed) == 1:
+                    i = changed[0]
+                    previous = self._previous_rivers[i]
+                    if len(river_tuple[i]) == len(previous) + 1 and river_tuple[i][:-1] == previous:
+                        self._last_discard = river_tuple[i][-1]
+                    else:
+                        self._last_discard = None
+                elif changed:
+                    # Multiple changes between frames do not reveal discard order.
+                    self._last_discard = None
+                if any(len(river_tuple[i]) < len(self._previous_rivers[i]) for i in range(4)):
+                    problems.append("牌河发生缩短，请等待稳定画面或手动核对")
         self._previous_rivers = river_tuple
         self._riichi_latched = riichi
         last_discard = self._last_discard
@@ -395,6 +504,10 @@ class VisionReader:
         except ValueError as error:
             problems.append(str(error))
             state = None
+        if problems or state is None or confidence < 0.90:
+            (self._previous_rivers, self._last_discard, self._riichi_latched,
+             self._last_scores, self._last_round_wind, self._last_round_number,
+             self._last_honba, self._last_meta_scan) = history
         debug["recognized_hand"] = own_hand
         debug["recognized_buttons"] = sorted(buttons)
         return Observation(state, confidence, tuple(problems), debug)

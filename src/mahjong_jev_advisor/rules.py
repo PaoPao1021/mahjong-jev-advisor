@@ -267,7 +267,7 @@ def _discard_candidates(state: GameState) -> list[Candidate]:
 
 def _chi_options(state: GameState) -> list[Candidate]:
     if not state.last_discard or state.last_discard[1] == "z":
-        return [Candidate("chi", None, "吃", "界面允许吃牌；需在游戏内选择组合")]
+        raise UncertainState("吃牌按钮与最近弃牌矛盾，请核对最近弃牌")
     called = normal(state.last_discard)
     n, suit = int(called[0]), called[1]
     have = Counter(normal(t) for t in state.hand)
@@ -286,11 +286,15 @@ def _chi_options(state: GameState) -> list[Candidate]:
                 potential_yaku=tuple(y_list),
             ))
     if not result:
-        return [Candidate("chi", state.last_discard, "吃", "界面允许吃牌；需在游戏内选择组合")]
+        raise UncertainState("吃牌按钮与手牌组合矛盾，请核对手牌")
     return result
 
 
 def _call_candidates(state: GameState) -> list[Candidate]:
+    have = Counter(normal(t) for t in state.hand)
+    for action, required in (("pon", 2), ("kan", 3)):
+        if action in state.buttons and (not state.last_discard or have[normal(state.last_discard)] < required):
+            raise UncertainState("碰杠按钮与手牌或最近弃牌矛盾，请手动核对")
     result = [Candidate("pass", None, "过", "保留门清与当前手牌形状")]
     if "chi" in state.buttons:
         result.extend(_chi_options(state))
