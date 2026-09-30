@@ -298,8 +298,9 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched: Any, event: Any) -> bool:
         if (
-            watched is self.content_scroll.viewport()
-            and event.type() == QEvent.Type.Wheel
+            # Qt can deliver teardown events after the scroll area is deleted.
+            event.type() == QEvent.Type.Wheel
+            and watched is self.content_scroll.viewport()
             and event.modifiers() & Qt.KeyboardModifier.ControlModifier
         ):
             self.wheelEvent(event)

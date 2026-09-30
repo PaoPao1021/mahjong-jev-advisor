@@ -29,6 +29,16 @@ EXPECTED_EXTENSION_VERSION = "0.1.3"
 DEFAULT_SCHEMA_PATH = Path(__file__).parent / "liqi.json"
 
 
+def decode_action_data(data: bytes) -> bytes:
+    """Undo Liqi's live-notification XOR; restore actions are already plain.
+
+    Protocol reference: Sunalamye/Naki, LiqiParser.swift (liqiDecode).
+    """
+    keys = (0x84, 0x5e, 0x4e, 0x42, 0x39, 0xa2, 0x1f, 0x60, 0x1c)
+    return bytes(value ^ (((23 ^ len(data)) + 5 * index + keys[index % 9]) & 0xff)
+                 for index, value in enumerate(data))
+
+
 def _varint(data: bytes, offset: int) -> tuple[int, int]:
     value = 0
     shift = 0
@@ -117,12 +127,35 @@ class LiqiDecoder:
             field_name, field_spec = field
             field_type = field_spec.get("type", "bytes")
             repeated = field_spec.get("rule") == "repeated"
+            scalar_type = self._resolve(field_type, resolved)
+            expected_wire = (0 if field_type in self._VARINTS or scalar_type in self.enums
+                             else 5 if field_type in self._FIXED32
+                             else 1 if field_type in self._FIXED64 else 2)
+            if wire != expected_wire and not (repeated and wire == 2 and expected_wire == 0):
+                raise ValueError(f"protobuf wire mismatch: {resolved}.{field_name}")
             value = self._convert(raw, wire, field_type, resolved, repeated)
             if repeated:
                 bucket = result.setdefault(field_name, [])
                 bucket.extend(value if isinstance(value, list) else [value])
             else:
                 result[field_name] = value
+        # Proto3 omits default scalars, including seat 0 and East 1 metadata.
+        for field_name, field_spec in spec.get("fields", {}).items():
+            if field_name in result:
+                continue
+            field_type = field_spec.get("type", "bytes")
+            if field_spec.get("rule") == "repeated":
+                result[field_name] = []
+            elif field_type == "bool":
+                result[field_name] = False
+            elif field_type in self._VARINTS or self._resolve(field_type, resolved) in self.enums:
+                result[field_name] = 0
+            elif field_type in self._FIXED32 | self._FIXED64:
+                result[field_name] = 0
+            elif field_type == "string":
+                result[field_name] = ""
+            elif field_type == "bytes":
+                result[field_name] = b""
         return result
 
     def _convert(self, raw: Any, wire: int, field_type: str, context: str, repeated: bool) -> Any:
@@ -348,11 +381,12 @@ class HookStateBuilder:
 class HookProtocol:
     def __init__(self, schema: dict[str, Any] | None = None):
         self.decoder: LiqiDecoder | None = None
-        self.requests: dict[int, str] = {}
+        self.requests: dict[tuple[str, int], str] = {}
         self.builder = HookStateBuilder()
         self.auth_account_id: int | None = None
         self.messages_seen = 0
         self.last_message_name = ""
+        self.last_action_name = ""
         if schema is not None:
             self.set_schema(schema)
         elif DEFAULT_SCHEMA_PATH.exists():
@@ -365,7 +399,7 @@ class HookProtocol:
     def set_schema(self, schema: dict[str, Any]) -> None:
         self.decoder = LiqiDecoder(schema)
 
-    def feed(self, direction: str, frame: bytes) -> GameState | None:
+    def feed(self, direction: str, frame: bytes, connection: str = "") -> GameState | None:
         decoder = self.decoder
         if decoder is None or len(frame) < 2:
             return None
@@ -379,7 +413,7 @@ class HookProtocol:
         if direction == "send" and category == 2:
             wrapper = decoder.decode("lq.Wrapper", frame[3:])
             name = str(wrapper.get("name", "")).lstrip(".")
-            self.requests[request_id] = name
+            self.requests[connection, request_id] = name
             if name.endswith("FastTest.authGame"):
                 try:
                     payload = decoder.decode("lq.ReqAuthGame", wrapper.get("data", b""))
@@ -388,15 +422,17 @@ class HookProtocol:
                     pass
             return None
         if direction == "receive" and category == 3:
-            request = self.requests.pop(request_id, "")
+            request = self.requests.pop((connection, request_id), "")
             response_type = decoder.methods.get(request)
             if response_type:
-                payload = decoder.decode(response_type, frame[3:])
+                # Responses have the same Wrapper as requests; the method is empty.
+                wrapper = decoder.decode("lq.Wrapper", frame[3:])
+                payload = decoder.decode(response_type, wrapper.get("data", b""))
                 if response_type.endswith("ResAuthGame"):
                     seat_list = payload.get("seatList") or payload.get("seat_list") or []
                     if self.auth_account_id is not None and self.auth_account_id in seat_list:
                         self.builder.own_seat = seat_list.index(self.auth_account_id)
-                elif response_type.endswith("ResSyncGame"):
+                elif response_type.endswith(("ResSyncGame", "ResEnterGame")):
                     state = self.builder.restore(payload)
                     restore = payload.get("gameRestore") or payload.get("game_restore") or {}
                     for proto in restore.get("actions", []):
@@ -404,6 +440,7 @@ class HookProtocol:
                         action_data = proto.get("data", b"")
                         if action_name and isinstance(action_data, bytes):
                             action = decoder.decode(action_name, action_data)
+                            self.last_action_name = action_name
                             state = self.builder.apply(action_name, action) or state
                     return state
         return None
@@ -418,7 +455,8 @@ class HookProtocol:
             action_name = str(payload.get("name", "")).lstrip(".")
             action_data = payload.get("data", b"")
             if action_name and isinstance(action_data, bytes):
-                action = self.decoder.decode(action_name, action_data)
+                self.last_action_name = action_name
+                action = self.decoder.decode(action_name, decode_action_data(action_data))
                 return self.builder.apply(action_name, action)
         if short.rsplit(".", 1)[-1].startswith("Action"):
             return self.builder.apply(short, payload)
@@ -537,7 +575,8 @@ class HookBridge:
                         bridge.frames_seen += 1
                         if bridge.frames_seen == 1:
                             bridge._emit_stage("frames-ready", "已捕获雀魂数据帧 · 正在解析牌局")
-                        state = bridge.protocol.feed(packet.get("direction", "receive"), frame)
+                        state = bridge.protocol.feed(packet.get("direction", "receive"), frame,
+                                                     str(packet.get("socketId") or packet.get("url", "")))
                         if state is not None:
                             bridge.states_seen += 1
                             bridge._last_stage = "state-ready"

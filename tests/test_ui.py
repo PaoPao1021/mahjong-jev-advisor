@@ -114,6 +114,16 @@ def test_main_window_instantiation(qapp):
     window.close()
 
 
+def test_teardown_event_after_scroll_area_deleted(qapp):
+    from PySide6.QtCore import QEvent
+    from shiboken6 import delete
+
+    window = MainWindow()
+    window.close()
+    delete(window.content_scroll)
+    assert window.eventFilter(window, QEvent(QEvent.Type.DeferredDelete)) is False
+
+
 def test_interactive_hand_simulation(qapp):
     window = MainWindow()
     window.show()

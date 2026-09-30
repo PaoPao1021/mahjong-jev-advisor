@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from mahjong_jev_advisor.hook import HookProtocol, HookStateBuilder, LiqiDecoder
 from mahjong_jev_advisor.tiles import RED_TILES, TILES
@@ -36,7 +37,8 @@ SCHEMA = {"nested": {"lq": {"nested": {
 
 
 def action_frame(name, payload):
-    prototype = field(2, name.encode()) + field(3, payload)
+    from mahjong_jev_advisor.hook import decode_action_data
+    prototype = field(2, name.encode()) + field(3, decode_action_data(payload))
     wrapper = field(1, b".lq.ActionPrototype") + field(2, prototype)
     return b"\x01" + wrapper
 
@@ -162,6 +164,51 @@ def test_default_schema_loaded():
     assert "lq.ActionDiscardTile" in protocol.decoder.types
 
 
+def test_live_xor_known_vector_and_omitted_seat_zero():
+    from mahjong_jev_advisor.hook import decode_action_data
+
+    assert decode_action_data(bytes.fromhex("9d757b606ba1")) == bytes.fromhex("08011202356d")
+    protocol = HookProtocol()
+    protocol.builder.hand = list(TILES[:13])
+    # A proto3 zero seat is absent on the wire, but still means seat 0.
+    state = protocol.feed("receive", action_frame("ActionDealTile", field(2, b"5m")))
+    assert state is not None and state.seat == 0 and len(state.hand) == 14
+
+
+def test_response_wrappers_and_request_ids_isolated_by_connection():
+    protocol = HookProtocol()
+    auth_req = field(1, 1001, 0)
+    protocol.feed("send", b"\x02\x01\x00" + field(1, b".lq.FastTest.authGame") + field(2, auth_req), "game")
+    protocol.feed("send", b"\x02\x01\x00" + field(1, b".lq.Lobby.heatbeat") + field(2, b""), "lobby")
+    # Packed seat_list in the real RESPONSE Wrapper.
+    auth_res = field(3, vi(2002) + vi(1001) + vi(3003) + vi(4004))
+    protocol.feed("receive", b"\x03\x01\x00" + field(1, b"") + field(2, auth_res), "game")
+    assert protocol.builder.own_seat == 1
+    assert ("lobby", 1) in protocol.requests
+
+
+@pytest.mark.parametrize("method", ["enterGame", "syncGame"])
+def test_wrapped_restore_actions_are_plain_not_xor(method):
+    protocol = HookProtocol()
+    request = field(1, f".lq.FastTest.{method}".encode()) + field(2, b"")
+    protocol.feed("send", b"\x02\x07\x00" + request)
+    snapshot = b"".join(field(6, tile.encode()) for tile in TILES[:13])
+    # Snapshot index_player=0 is also omitted, as on a proto3 connection.
+    deal = field(2, b"5m")
+    plain_action = field(2, b"ActionDealTile") + field(3, deal)
+    restore = field(1, snapshot) + field(2, plain_action)
+    response = field(4, restore)
+    state = protocol.feed("receive", b"\x03\x07\x00" + field(1, b"") + field(2, response))
+    assert state is not None and len(state.hand) == 14 and state.hand[-1] == "5m"
+    assert state.seat == 0
+
+
+def test_wire_type_mismatch_raises_controlled_error():
+    decoder = HookProtocol().decoder
+    with pytest.raises(ValueError, match="wire mismatch"):
+        decoder.decode("lq.ActionDealTile", field(2, 1, 0))
+
+
 def test_full_round_flow_with_bundled_schema():
     protocol = HookProtocol()
     # 1. authGame
@@ -170,7 +217,7 @@ def test_full_round_flow_with_bundled_schema():
     protocol.feed("send", b"\x02\x01\x00" + wrapper_req)
 
     auth_res = field(3, 2002, 0) + field(3, 1001, 0) + field(3, 3003, 0) + field(3, 4004, 0)
-    protocol.feed("receive", b"\x03\x01\x00" + auth_res)
+    protocol.feed("receive", b"\x03\x01\x00" + field(1, b"") + field(2, auth_res))
     assert protocol.builder.own_seat == 1
 
     # 2. ActionNewRound
