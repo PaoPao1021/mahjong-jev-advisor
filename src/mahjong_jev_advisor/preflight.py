@@ -8,6 +8,8 @@ import json
 import sys
 from pathlib import Path
 
+from .resources import extension_dir
+
 
 def inspect(*, online: bool = False, capture: bool = True) -> dict:
     checks = []
@@ -30,7 +32,7 @@ def inspect(*, online: bool = False, capture: bool = True) -> dict:
     from .settings import Settings
     from .vision import REGIONS, TEMPLATE_LABELS, TemplateStore
     settings = Settings.load()
-    extension = Path(__file__).resolve().parents[2] / "browser-extension"
+    extension = extension_dir()
     hook_files = all((extension / name).is_file() for name in ("manifest.json", "content.js", "page-hook.js"))
     add("网页 Hook", "ok" if hook_files else "blocked",
         "扩展文件齐全；需在 Edge/Chrome 加载后刷新雀魂" if hook_files else "浏览器扩展文件缺失")

@@ -67,7 +67,22 @@
 
 ## 快速开始
 
-推荐流程：**下载项目 → 启动顾问 → 测试模型连接 → 安装浏览器扩展 → 进入牌局。**
+推荐流程：**获取启动包或源码 → 启动顾问 → 测试模型连接 → 安装浏览器扩展 → 进入牌局。**
+
+### 免 Python 启动包
+
+发布包由 [Portable release builds](https://github.com/PaoPao1021/mahjong-jev-advisor/actions/workflows/release.yml) 工作流构建。正式发布后的 ZIP 可从 [Releases](https://github.com/PaoPao1021/mahjong-jev-advisor/releases) 下载；若尚无正式版本，可在已成功的手动构建记录中下载 `portable-*` 候选包（GitHub Actions 下载需登录）。Actions 下载得到的外层压缩包中包含应用 ZIP 和 SHA256 文件，请继续解压应用 ZIP。
+
+| 文件名后缀 | 适用设备 | 启动方式 |
+| --- | --- | --- |
+| `windows-x64.zip` | 64 位 Windows Intel / AMD | 解压完整文件夹，双击 `MahjongJevAdvisor.exe` |
+| `macos-arm64.zip` | Apple Silicon Mac | 解压后双击 `MahjongJevAdvisor.app` |
+
+包内含 Python、Qt、OCR 模型、`browser-extension` 和 `QUICKSTART.txt`。**不需要安装 Python 或 pip**，但仍需自行配置 API Key 并安装浏览器扩展。保留应用旁边的扩展文件夹，不要只移动 EXE / APP。Intel Mac 暂用下方源码方式启动。
+
+候选包未进行商业证书签名或 Apple 公证，系统可能提示来源未知；具体启动说明见包内 `QUICKSTART.txt`。下载后可用同名 `.zip.sha256` 文件校验。便携包验证包括实际启动冻结后的程序、加载 OCR 模型、三麻/四麻候选计算及 Qt 渲染，不代表所有目标设备均已完成手动验收。
+
+以下为源码启动方式：
 
 ### 1. 获取项目
 
@@ -372,6 +387,21 @@ python3.12 -m venv .venv
 测试覆盖状态校验、四麻与三麻规则、Hook 解码及恢复、协议解析、真实本机 HTTP 往返、临时失败重试、Qt 后台任务与界面更新。测试使用隔离配置目录，避免修改真实用户设置。
 
 CI 在 Windows 和 macOS 上安装项目、运行 pytest 和 JSONL 回放，最新结果见 [Actions](https://github.com/PaoPao1021/mahjong-jev-advisor/actions/workflows/ci.yml)。本机 HTTP 测试不依赖付费模型账户，也不能证明外部服务当前可用；状态回放耗时不包含屏幕识别或远程模型耗时。
+
+### 构建发布包
+
+在对应操作系统的干净 Python 3.12 虚拟环境中，安装开发依赖与 PyInstaller，然后执行：
+
+```bash
+python -m pip install -e '.[dev]' 'pyinstaller>=6.11,<7'
+python scripts/build_release.py
+```
+
+Windows PowerShell 也可执行上述命令。产物在 `dist/`，包括带版本、系统及架构名称的 ZIP 和 SHA256 文件；已有同名目录时先移走旧产物。每个平台需要原生构建，不能在 macOS 上直接生成 Windows EXE。
+
+推荐在 GitHub Actions 的 **Portable release builds → Run workflow** 手动生成候选包。工作流运行回归测试后构建，再执行冻结应用的离线冒烟检查；任一步失败均不会上传可分发包。`build-diagnostics-*` 保存打包诊断。
+
+正式发布时，先修改 `pyproject.toml` 的版本、提交并推送，再推送匹配的 `v<版本号>` 标签。两个平台构建均成功后，工作流创建 **Draft Release** 并附上 ZIP 与校验文件；维护者检查后手动发布。标签与项目版本不一致时构建会失败，工作流也不会覆盖已公开 Release。
 
 ### 数据处理流程
 

@@ -9,6 +9,8 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .resources import extension_dir
 from typing import Any
 
 import cv2
@@ -423,7 +425,7 @@ class MainWindow(QMainWindow):
         menu.exec(self.title_bar.btn_table.mapToGlobal(QPoint(0, self.title_bar.btn_table.height() + 2)))
 
     def open_hook_extension(self) -> None:
-        directory = Path(__file__).resolve().parents[2] / "browser-extension"
+        directory = extension_dir()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
         self.bottom_bar.set_status_info("网页 Hook 扩展目录已打开", "在浏览器扩展页选择“加载解压缩的扩展”")
 

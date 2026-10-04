@@ -1,0 +1,37 @@
+雀魂 · Jev 实时决策顾问 — 快速开始
+
+1. 将整个 ZIP 解压到固定文件夹。不要在压缩包里启动，也不要单独移动 EXE。
+   Windows：双击 MahjongJevAdvisor.exe。
+   macOS：双击 MahjongJevAdvisor.app，并保留同目录 browser-extension 文件夹。
+   不需要安装 Python、pip 或额外下载 OCR 模型。
+
+2. 点击【Jev设置】，选择平台，填写自己的 API Key，测试连接成功后保存。
+   官网：TypeSafe https://typesafe.ai/
+         Vercel https://vercel.com/ai-gateway
+         OpenRouter https://openrouter.ai/
+   各平台 Key 不通用。在线服务可能收费，软件包不包含 Key 或额度。
+   【大模型设置】仅用于可选的【深度解析】。
+
+3. Chrome 打开 chrome://extensions，Edge 打开 edge://extensions。
+   开启开发者模式，加载本包中的 browser-extension 文件夹。
+   桌面程序【桌】→【打开网页 Hook 扩展目录】也能定位此文件夹。
+   完整刷新雀魂网页，再进入牌局；看到“实时牌局已识别”后核对手牌。
+   若尚未自动运行，点击【开始识别】。
+
+4. 三人/四人玩法由 Hook 自动识别。你仍需自行在游戏中执行操作。
+   Hook 模式不要求截图校准；截图备用模式需要录屏权限、区域校准及模板。
+
+本候选包未使用商业证书签名，也未完成 Apple 公证。
+Windows SmartScreen 或 macOS Gatekeeper 可能提示来源未知。
+请先确认下载来自项目仓库并核对 SHA256，再通过系统提供的“仍要运行”/
+“隐私与安全性 → 仍要打开”选项授权；不要关闭全局系统防护。
+如果系统没有提供放行选项，可按 README 使用源码启动。
+
+配置保存在用户目录，升级时替换程序即可；扩展更新后需重新加载并刷新游戏。
+API Key 在本机 settings.json 中明文保存，不要分享该文件。
+在线分析会将自己的手牌和公开局况发送到所选服务。
+
+README、故障排查与源码：
+https://github.com/PaoPao1021/mahjong-jev-advisor
+报告问题：
+https://github.com/PaoPao1021/mahjong-jev-advisor/issues
