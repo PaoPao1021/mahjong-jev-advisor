@@ -227,6 +227,16 @@ zsh run_macos.sh
 
 ### 在线决策：Jev 设置
 
+可从以下官网注册或登录对应平台，申请该平台的 API Key：
+
+| 平台 | 官网 |
+| --- | --- |
+| TypeSafe AI | [typesafe.ai](https://typesafe.ai/) |
+| Vercel AI Gateway | [vercel.com/ai-gateway](https://vercel.com/ai-gateway) |
+| OpenRouter | [openrouter.ai](https://openrouter.ai/) |
+
+三个平台的 API Key 不能混用，请在【Jev设置】中选择与 Key 对应的服务。**官网用于访问平台；下表中的 POST 地址才是程序请求接口。**
+
 以下是**程序内置预设**，可按服务商提供的信息修改。账户权限、可用模型及收费以对应服务为准。
 
 | 协议 | 完整 POST 地址 | 预设模型 |
