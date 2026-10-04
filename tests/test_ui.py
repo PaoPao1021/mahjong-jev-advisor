@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import time
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 import pytest
@@ -27,6 +28,24 @@ def qapp():
     if app is None:
         app = QApplication([])
     return app
+
+
+
+def wait_for_ui(qapp, predicate, *, timeout=10.0, diagnostic=lambda: ""):
+    """Pump queued Qt signals while giving Python workers time to run.
+
+    QTest.qWait alone is not a reliable scheduling point for Python QRunnables
+    and the HTTP server on Windows. sleep explicitly releases the GIL, and a
+    monotonic deadline bounds the wait without assuming a runner's speed.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        qapp.processEvents()
+        if predicate():
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(f"UI did not complete within {timeout:g}s: {diagnostic()}")
+        time.sleep(0.01)
 
 
 def test_mahjong_tile_widget_rendering(qapp):
@@ -222,16 +241,16 @@ def test_dialog_button_sends_actual_http_and_receives_answer(qapp, http_server):
     from mahjong_jev_advisor.ui_dialogs import JevSettingsDialog
     from mahjong_jev_advisor.settings import Settings
     dialog = JevSettingsDialog(Settings(api_key="test", model_endpoint=http_server.endpoint))
-    dialog.show()
-    QTest.mouseClick(dialog.test_button, Qt.MouseButton.LeftButton)
-    for _ in range(100):
-        QTest.qWait(20)
-        if dialog.test_button.isEnabled():
-            break
-    assert len(http_server.received) == 1
-    assert "连接成功" in dialog.result.toPlainText()
-    assert "HTTP 200" in dialog.result.toPlainText()
-    dialog.close()
+    try:
+        dialog.show()
+        QTest.mouseClick(dialog.test_button, Qt.MouseButton.LeftButton)
+        wait_for_ui(qapp, dialog.test_button.isEnabled,
+                    diagnostic=dialog.result.toPlainText)
+        assert len(http_server.received) == 1
+        assert "连接成功" in dialog.result.toPlainText()
+        assert "HTTP 200" in dialog.result.toPlainText()
+    finally:
+        dialog.close()
 
 
 def test_uncertain_frame_removes_previous_recommendation(qapp):
@@ -255,16 +274,17 @@ def test_real_decision_worker_updates_ui_from_http_reply(qapp, http_server):
     state = GameState.from_dict({"hand": "123m456p789s123z55m"})
     window.last_state = state
     window.pending_identity = state.identity()
-    window.start_advice(state)
-    for _ in range(100):
-        QTest.qWait(20)
-        if not window.advice_busy:
-            break
-    assert len(http_server.received) == 1
-    assert window._current_chosen is not None
-    assert "test-model" in window.hero_card.source_label.text()
-    assert window.hero_card.bars_layout.count() == 0  # No invented probability bars.
-    window.close()
+    try:
+        window.start_advice(state)
+        wait_for_ui(qapp, lambda: not window.advice_busy,
+                    diagnostic=lambda: f"HTTP requests={len(http_server.received)}; "
+                    f"status={window.hero_card.source_label.text()}")
+        assert len(http_server.received) == 1
+        assert window._current_chosen is not None
+        assert "test-model" in window.hero_card.source_label.text()
+        assert window.hero_card.bars_layout.count() == 0  # No invented probability bars.
+    finally:
+        window.close()
 
 
 @pytest.mark.parametrize('failed', [False, True])
