@@ -242,7 +242,7 @@ def analyze_yaku_potential(state: GameState, hand: tuple[str, ...]) -> list[str]
         match_count = sum([bool(seq_m & set(norm_hand)), bool(seq_p & set(norm_hand)), bool(seq_s & set(norm_hand))])
         if match_count == 3:
             common_nums.add(n)
-    if common_nums:
+    if common_nums and state.player_count == 4:
         hints.append("三色同顺潜能")
 
     # 10. 国士无双潜能
@@ -282,7 +282,10 @@ def estimate_tenpai_value(
             curr = []
     meld_objs = parse_melds_to_objects(meld_groups)
 
-    dora_136 = [tiles_to_136([ind])[0] for ind in state.dora_indicators if ind]
+    # The upstream calculator uses four-player indicator order. Translate 1m
+    # to 8m internally so it awards the sanma 9m bonus correctly.
+    dora_136 = [tiles_to_136(["8m" if state.player_count == 3 and ind == "1m" else ind])[0]
+                for ind in state.dora_indicators if ind]
     player_wind = _WIND_MAP.get(state.seat_wind, EAST)
     round_wind = _WIND_MAP.get(state.round_wind, EAST)
 
@@ -315,8 +318,16 @@ def estimate_tenpai_value(
                 dora_indicators=dora_136, config=config_tsumo
             )
             if res.error is None and res.cost:
-                han_values.append(res.han)
-                scores.append(res.cost.get("total", 0))
+                yakuman = any(y.is_yakuman for y in (res.yaku or []))
+                north_bonus = 0
+                if state.player_count == 3 and state.nuki and not yakuman:
+                    north_bonus = state.nuki[state.seat] * (1 + state.dora_indicators.count("3z"))
+                han_values.append(res.han + north_bonus)
+                # The scoring library assumes four payers. Do not present its
+                # total as a sanma payout (room tsumo-loss rules can vary).
+                scores.append(res.cost.get("total", 0) if state.player_count == 4 else 0)
+                if north_bonus:
+                    yaku_frequency["拔北宝牌"] += 1
                 for y in (res.yaku or []):
                     yaku_frequency[translate_yaku(y.name)] += 1
             elif res.error == "no_yaku":

@@ -627,6 +627,12 @@ class ManualStateDialog(QDialog):
         form = QFormLayout()
         form.setSpacing(8)
 
+        self.player_count = QComboBox()
+        self.player_count.addItem("四人麻将", 4)
+        self.player_count.addItem("三人麻将（雀魂）", 3)
+        self.player_count.setCurrentIndex(1 if self.base.get("player_count") == 3 else 0)
+        form.addRow("玩法:", self.player_count)
+
         self.hand = QLineEdit(" ".join(self.base.get("hand", [])))
         self.hand.setPlaceholderText("例如 4m4m1p1p4p4p4p2s2s2s7s8s9s1p 或空格分隔")
         form.addRow("当前手牌:", self.hand)
@@ -674,15 +680,30 @@ class ManualStateDialog(QDialog):
         riichi_layout.setContentsMargins(0, 0, 0, 0)
         riichi_layout.setSpacing(14)
         self.riichi_checks: list[QCheckBox] = []
-        for i, title in enumerate(("我 (自家)", "下家", "对家", "上家")):
-            check = QCheckBox(title)
-            known = self.base.get("riichi", [False] * 4)[i]
+        for i in range(4):
+            check = QCheckBox()
+            known = (list(self.base.get("riichi", [])) + [False] * 4)[i]
             check.setChecked(bool(known))
             riichi_layout.addWidget(check)
             self.riichi_checks.append(check)
         riichi_layout.addStretch()
         form.addRow("立直状态:", riichi_row)
 
+        def update_player_fields():
+            count = self.player_count.currentData()
+            for seat, check in enumerate(self.riichi_checks):
+                check.setVisible(seat < count)
+                check.setText(f"玩家 {seat + 1}" + ("（自家）" if seat == self.base.get("seat", 0) else ""))
+            old_round = self.round_number.currentText()
+            self.round_number.clear()
+            self.round_number.addItems([str(i + 1) for i in range(count)])
+            self.round_number.setCurrentText(old_round if old_round in [str(i + 1) for i in range(count)] else "1")
+            old_wind = self.seat_wind.currentText()
+            self.seat_wind.clear()
+            self.seat_wind.addItems(list("ESWN"[:count]))
+            self.seat_wind.setCurrentText(old_wind if old_wind in "ESWN"[:count] else "E")
+        self.player_count.currentIndexChanged.connect(update_player_fields)
+        update_player_fields()
         quick_layout.addLayout(form)
 
         self.learn_and_resume = QCheckBox("用本次核对自动学习当前牌面，并恢复实时监测")
@@ -713,6 +734,15 @@ class ManualStateDialog(QDialog):
                 if not self.hand.text().strip():
                     raise ValueError("请填写当前手牌")
                 data = dict(self.base)
+                count = self.player_count.currentData()
+                data["player_count"] = count
+                if int(data.get("seat", 0)) >= count:
+                    raise ValueError("当前座位不适用于三人麻将，请在高级 JSON 中核对座位")
+                for field, default in (("rivers", []), ("melds", []), ("scores", None), ("nuki", 0)):
+                    values = list(data.get(field, []))
+                    if field != "scores" and any(values[count:]):
+                        raise ValueError("被移除玩家仍有数据，请在高级 JSON 中核对后切换玩法")
+                    data[field] = (values + [default] * count)[:count]
                 data.update({
                     "hand": self.hand.text().strip(),
                     "dora_indicators": self.dora.text().strip(),
@@ -722,7 +752,7 @@ class ManualStateDialog(QDialog):
                     "round_wind": self.round_wind.currentText(),
                     "round_number": int(self.round_number.currentText()),
                     "seat_wind": self.seat_wind.currentText(),
-                    "riichi": [x.isChecked() for x in self.riichi_checks],
+                    "riichi": [x.isChecked() for x in self.riichi_checks[:count]],
                     "observation_confidence": 1.0,
                 })
             else:

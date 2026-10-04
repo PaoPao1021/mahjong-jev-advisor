@@ -315,6 +315,7 @@ class FourPlayersRiverWidget(QFrame):
         my_seat: int = 0,
     ) -> None:
         for i in range(4):
+            self.rows[i].setVisible(i < len(scores))
             score = scores[i] if i < len(scores) else None
             is_riichi = bool(riichi[i]) if i < len(riichi) and riichi[i] is not None else False
             r_tiles = rivers[i] if i < len(rivers) else []

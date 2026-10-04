@@ -7,6 +7,8 @@ Provides rich, professional mahjong master commentary on the current board state
 from __future__ import annotations
 
 import json
+import http.client
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -17,6 +19,10 @@ from .state import Candidate, GameState
 
 
 class LLMError(Exception):
+    pass
+
+
+class LLMUnavailableError(LLMError):
     pass
 
 
@@ -49,6 +55,8 @@ def _format_state_prompt(state: GameState, chosen: Candidate) -> str:
     wait_str = " ".join(chosen.improving_tiles[:6]) if chosen.improving_tiles else "未知"
 
     return f"""【当前局况】
+玩法: {state.player_count}人立直麻将；已拔北: {state.nuki}
+{("三麻：无二至八万、不能吃、一万指示九万；拔北不破门清，宝牌不能单独成役。" if state.player_count == 3 else "四人标准规则。 ")}
 场况: {round_desc} · {seat_desc} · {score_desc}
 {dora_desc}
 {threat_desc}
@@ -68,7 +76,7 @@ def _format_state_prompt(state: GameState, chosen: Candidate) -> str:
 字数控制在250字以内，重点突出，切中要害。"""
 
 
-def query_llm_analysis(
+def _query_llm_analysis_once(
     state: GameState,
     chosen: Candidate,
     settings: Settings,
@@ -116,16 +124,31 @@ def query_llm_analysis(
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
             raise LLMAuthError(f"大模型认证失败 (HTTP {error.code})：API Key 无效或过期。") from error
+        if error.code == 429 or error.code >= 500:
+            raise LLMUnavailableError(f"大模型服务异常 HTTP {error.code}") from error
         raise LLMError(f"大模型服务异常 HTTP {error.code}") from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        raise LLMError(f"网络连接大模型超时或失败：{error}") from error
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
+        raise LLMUnavailableError(f"网络连接大模型超时或失败：{error}") from error
     except ValueError as error:
         raise LLMError(f"大模型响应数据解析失败：{error}") from error
 
     try:
-        content = data["choices"][0]["message"]["content"].strip()
+        content = data["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            raise LLMError("大模型响应缺少文本内容")
+        content = content.strip()
         if not content:
             raise LLMError("大模型返回了空内容")
         return content
     except (KeyError, IndexError, TypeError) as error:
         raise LLMError(f"大模型响应格式不匹配: {error}") from error
+
+
+def query_llm_analysis(state: GameState, chosen: Candidate, settings: Settings, timeout: float = 20.0) -> str:
+    for attempt in range(3):
+        try:
+            return _query_llm_analysis_once(state, chosen, settings, timeout)
+        except LLMUnavailableError:
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (2 ** attempt))

@@ -276,13 +276,19 @@ BUTTON_WORDS = {
     "pon": ("碰", "ポン", "pon"),
     "kan": ("杠", "槓", "カン", "kan"),
     "pass": ("过", "過", "跳遇", "パス", "pass"),
+    "nuki": ("拔北", "抜き", "nuki"),
     "kyuushu": ("九种九牌", "九種九牌"),
 }
 
 
 def parse_buttons(text: str, self_draw: bool | None = None) -> frozenset[str]:
     lower = text.lower().replace(" ", "")
-    found = {key for key, words in BUTTON_WORDS.items() if any(word.lower() in lower for word in words)}
+    # English action names need token boundaries: "riichi" contains "chi".
+    found = {key for key, words in BUTTON_WORDS.items() if any(
+        re.search(r"(?<![a-z])" + re.escape(word.lower()) + r"(?![a-z])", text.lower())
+        if word.isascii() else word.lower() in lower
+        for word in words
+    )}
     if "和" in lower and not found & {"ron", "tsumo"} and self_draw is not None:
         found.add("tsumo" if self_draw else "ron")
     if found & {"chi", "pon", "kan", "ron"}:

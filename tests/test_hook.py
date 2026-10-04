@@ -251,6 +251,8 @@ def test_red_five_removal_precision():
 
 def test_gang_babei_and_score_updates():
     protocol = HookProtocol()
+    protocol.builder.player_count = 3
+    protocol.builder.reset()
     protocol.builder.own_seat = 0
     protocol.builder.hand = ["1m", "1m", "1m", "1m", "4z", "2p", "3p", "4p", "5p", "6p", "7p", "8p", "9p", "1z"]
     protocol.builder.doras = ["1s"]
@@ -282,12 +284,12 @@ def test_gang_babei_and_score_updates():
 
     # 3. ActionNoTile with deltaScores
     scores_info = {
-        "oldScores": [25000, 25000, 25000, 25000],
-        "deltaScores": [3000, -1000, -1000, -1000],
+        "oldScores": [35000, 35000, 35000],
+        "deltaScores": [2000, -1000, -1000],
     }
     state3 = protocol.builder.apply("ActionNoTile", {"scores": [scores_info]})
     assert state3 is not None
-    assert state3.scores == (28000, 24000, 24000, 24000)
+    assert state3.scores == (37000, 34000, 34000)
 
 
 def test_restore_with_post_snapshot_actions():

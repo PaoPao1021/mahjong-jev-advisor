@@ -199,7 +199,7 @@ class LiqiDecoder:
 
 class HookStateBuilder:
     OPERATION_BUTTONS = {2: "chi", 3: "pon", 4: "kan", 5: "kan", 6: "kan",
-                         7: "riichi", 8: "tsumo", 9: "ron", 10: "kyuushu"}
+                         7: "riichi", 8: "tsumo", 9: "ron", 10: "kyuushu", 11: "nuki"}
 
     def __init__(self):
         self.reset(keep_seat=False)
@@ -207,13 +207,15 @@ class HookStateBuilder:
     def reset(self, keep_seat: bool = True) -> None:
         if not keep_seat:
             self.own_seat = None
+            self.player_count = 4
         self.hand: list[str] = []
-        self.rivers: list[list[str]] = [[], [], [], []]
-        self.melds: list[list[str]] = [[], [], [], []]
-        self.meld_groups = [0, 0, 0, 0]
+        self.rivers: list[list[str]] = [[] for _ in range(self.player_count)]
+        self.melds: list[list[str]] = [[] for _ in range(self.player_count)]
+        self.meld_groups = [0] * self.player_count
+        self.nuki = [0] * self.player_count
         self.doras: list[str] = []
-        self.scores: list[int | None] = [None] * 4
-        self.riichi: list[bool | None] = [False] * 4
+        self.scores: list[int | None] = [None] * self.player_count
+        self.riichi: list[bool | None] = [False] * self.player_count
         self.chang = 0
         self.ju = 0
         self.honba = 0
@@ -226,7 +228,7 @@ class HookStateBuilder:
         if not isinstance(value, dict):
             return
         seat = value.get("seat")
-        if self.own_seat is None and isinstance(seat, int) and 0 <= seat < 4:
+        if self.own_seat is None and isinstance(seat, int) and 0 <= seat < self.player_count:
             self.own_seat = seat
         op_list = value.get("operationList") or value.get("operation_list") or []
         types = [item.get("type") for item in op_list if isinstance(item, dict)]
@@ -237,13 +239,15 @@ class HookStateBuilder:
     def apply(self, name: str, action: dict[str, Any]) -> GameState | None:
         short = name.rsplit(".", 1)[-1]
         if short == "ActionNewRound":
+            if len(action.get("scores", [])) in (3, 4):
+                self.player_count = len(action["scores"])
             self.reset(keep_seat=True)
             self.chang, self.ju = int(action.get("chang", 0)), int(action.get("ju", 0))
             self.honba, self.sticks = int(action.get("ben", 0)), int(action.get("liqibang", 0))
             self.hand = list(action.get("tiles", []))
             self.doras = list(action.get("doras") or ([action["dora"]] if action.get("dora") else []))
             scores = list(action.get("scores", []))
-            if len(scores) == 4:
+            if len(scores) == self.player_count:
                 self.scores = scores
             self._operations(action.get("operation"))
         elif short == "ActionDealTile":
@@ -255,7 +259,7 @@ class HookStateBuilder:
             self._operations(action.get("operation"))
         elif short == "ActionDiscardTile":
             seat, tile = action.get("seat"), action.get("tile")
-            if isinstance(seat, int) and 0 <= seat < 4 and isinstance(tile, str) and tile:
+            if isinstance(seat, int) and 0 <= seat < self.player_count and isinstance(tile, str) and tile:
                 self.rivers[seat].append(tile)
                 self.last_discard = tile
                 if seat == self.own_seat:
@@ -266,7 +270,7 @@ class HookStateBuilder:
             self._operations(action.get("operation"))
         elif short == "ActionChiPengGang":
             seat, tiles = action.get("seat"), list(action.get("tiles", []))
-            if isinstance(seat, int) and 0 <= seat < 4 and tiles:
+            if isinstance(seat, int) and 0 <= seat < self.player_count and tiles:
                 self.melds[seat].extend(tiles)
                 self.meld_groups[seat] += 1
                 if seat == self.own_seat:
@@ -280,7 +284,7 @@ class HookStateBuilder:
             self._operations(action.get("operation"))
         elif short == "ActionAnGangAddGang":
             seat, tile = action.get("seat"), action.get("tiles") or action.get("tile")
-            if isinstance(seat, int) and 0 <= seat < 4 and isinstance(tile, str):
+            if isinstance(seat, int) and 0 <= seat < self.player_count and isinstance(tile, str):
                 in_hand = sum(normal(value) == normal(tile) for value in self.hand)
                 # Mahjong Soul uses type=3 for a concealed kan and type=2 for
                 # an added kan. Opponents' concealed tiles are unavailable, so
@@ -297,6 +301,8 @@ class HookStateBuilder:
             self._operations(action.get("operation"))
         elif short == "ActionBaBei":
             seat = action.get("seat")
+            if isinstance(seat, int) and 0 <= seat < self.player_count:
+                self.nuki[seat] += 1
             if seat == self.own_seat:
                 self._remove("4z")
             self.doras = list(action.get("doras") or self.doras)
@@ -304,13 +310,13 @@ class HookStateBuilder:
         elif short in {"ActionHule", "ActionNoTile", "ActionLiuJu"}:
             self.buttons.clear()
             scores = list(action.get("scores", []))
-            if len(scores) == 4 and all(isinstance(x, int) for x in scores):
+            if len(scores) == self.player_count and all(isinstance(x, int) for x in scores):
                 self.scores = scores
             elif scores and isinstance(scores[0], dict):
                 first = scores[0]
                 old = first.get("oldScores") or first.get("old_scores") or []
                 delta = first.get("deltaScores") or first.get("delta_scores") or []
-                if len(old) == 4 and len(delta) == 4:
+                if len(old) == self.player_count and len(delta) == self.player_count:
                     self.scores = [int(o) + int(d) for o, d in zip(old, delta)]
         return self.state()
 
@@ -318,19 +324,24 @@ class HookStateBuilder:
         restore = payload.get("gameRestore") or payload.get("game_restore") or {}
         snapshot = restore.get("snapshot") or {}
         if snapshot:
+            if len(snapshot.get("players", [])) in (3, 4):
+                self.player_count = len(snapshot["players"])
             self.reset()
             self.chang, self.ju = int(snapshot.get("chang", 0)), int(snapshot.get("ju", 0))
             self.honba, self.sticks = int(snapshot.get("ben", 0)), int(snapshot.get("liqibang", 0))
             self.own_seat = snapshot.get("indexPlayer") if snapshot.get("indexPlayer") is not None else snapshot.get("index_player")
             self.hand = list(snapshot.get("hands", []))
             self.doras = list(snapshot.get("doras", []))
-            for seat, player in enumerate(snapshot.get("players", [])[:4]):
+            for seat, player in enumerate(snapshot.get("players", [])[:self.player_count]):
                 self.scores[seat] = player.get("score")
                 self.rivers[seat] = list(player.get("qipais", []))
                 for meld in player.get("mings", []):
                     tiles = list(meld.get("tile", []))
-                    self.melds[seat].extend(tiles)
-                    self.meld_groups[seat] += 1
+                    if tiles == ["4z"] and self.player_count == 3:
+                        self.nuki[seat] += 1
+                    else:
+                        self.melds[seat].extend(tiles)
+                        self.meld_groups[seat] += 1
                 self.riichi[seat] = int(player.get("liqiposition", 0)) > 0
         return self.state()
 
@@ -359,17 +370,18 @@ class HookStateBuilder:
                     return
 
     def state(self) -> GameState | None:
-        if self.own_seat is None or not 0 <= self.own_seat < 4 or not self.hand:
+        if self.own_seat is None or not 0 <= self.own_seat < self.player_count or not self.hand:
             return None
         winds = "ESWN"
         try:
             return GameState.from_dict({
+                "player_count": self.player_count, "nuki": self.nuki,
                 "hand": self.hand, "rivers": self.rivers, "melds": self.melds,
                 "dora_indicators": self.doras, "buttons": sorted(self.buttons),
                 "last_discard": self.last_discard, "seat": self.own_seat,
                 "round_wind": "E" if self.chang == 0 else "S" if self.chang == 1 else "?",
-                "round_number": self.ju + 1 if 0 <= self.ju < 4 else None,
-                "seat_wind": winds[(self.own_seat - self.ju) % 4],
+                "round_number": self.ju + 1 if 0 <= self.ju < self.player_count else None,
+                "seat_wind": winds[(self.own_seat - self.ju) % self.player_count],
                 "scores": self.scores, "riichi": self.riichi, "honba": self.honba,
                 "sticks": self.sticks, "open_melds": self.meld_groups[self.own_seat],
                 "observation_confidence": 1.0,

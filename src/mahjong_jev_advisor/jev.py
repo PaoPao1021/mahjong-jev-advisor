@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import math
 import time
 import urllib.error
@@ -58,7 +59,11 @@ class JevUnavailableError(JevError):
 def _request_body(state: GameState, options: tuple[Candidate, ...]) -> dict:
     return {
         "state": {
-            "game": "four-player Japanese riichi mahjong",
+            "game": "three-player Japanese riichi mahjong" if state.player_count == 3 else "four-player Japanese riichi mahjong",
+            "player_count": state.player_count,
+            "current_player": state.seat,
+            "extracted_north": list(state.nuki),
+            "variant_rules": "No 2m-8m, no chi. 1m indicator means 9m dora. North extraction preserves closed hand and adds bonus, but is not a yaku." if state.player_count == 3 else "Standard four-player riichi",
             "hand": list(state.hand),
             "visible_discards": [list(x) for x in state.rivers],
             "visible_melds": [list(x) for x in state.melds],
@@ -148,7 +153,7 @@ def _post(payload: dict, api_key: str, connection: ModelConnection) -> tuple[dic
         if error.code == 429 or error.code >= 500:
             raise JevUnavailableError(detail_text) from error
         raise JevError(detail_text) from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
         detail = str(error).replace(api_key.strip(), "[已隐藏]")
         raise JevUnavailableError(f"网络请求失败（超时上限 {connection.timeout:g}s）：{detail}") from error
     except ValueError as error:
@@ -206,8 +211,15 @@ def ask_jev(state: GameState, options: tuple[Candidate, ...], api_key: str, time
     connection = connection or ModelConnection(timeout=timeout if timeout is not None else 15.0)
     if not options or len(options) > 255:
         raise JevError("模型候选动作数量无效")
-    data, elapsed = _post(_request_body(state, options), api_key, connection)
-    return _parse(data, options, connection, elapsed)
+    started = time.perf_counter()
+    for attempt in range(3):
+        try:
+            data, elapsed = _post(_request_body(state, options), api_key, connection)
+            return _parse(data, options, connection, int((time.perf_counter() - started) * 1000))
+        except JevUnavailableError:
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (2 ** attempt))
 
 
 def test_connection(api_key: str, connection: ModelConnection) -> Advice:

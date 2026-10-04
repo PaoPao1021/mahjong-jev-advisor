@@ -265,3 +265,60 @@ def test_real_decision_worker_updates_ui_from_http_reply(qapp, http_server):
     assert "test-model" in window.hero_card.source_label.text()
     assert window.hero_card.bars_layout.count() == 0  # No invented probability bars.
     window.close()
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_hook_queues_latest_state_while_request_is_busy(qapp, monkeypatch, failed):
+    from dataclasses import replace
+    from mahjong_jev_advisor.state import Advice, Candidate, GameState
+    window = MainWindow()
+    window.running = True
+    old = GameState.from_dict({'hand': '123m456p789s123z55m'})
+    latest = replace(old, honba=1)
+    window.last_state = old
+    window.pending_identity = old.identity()
+    window.advice_busy = True
+    started = []
+    monkeypatch.setattr(window, 'start_advice', started.append)
+    window.on_hook_state(latest)
+    assert window.pending_identity == latest.identity()
+    assert not started
+    if failed:
+        window.on_advice_failure((old.identity(), 'old request failed'))
+    else:
+        window.on_advice((old.identity(), Advice(Candidate('discard', '1m', 'old', 'old')), old))
+    assert started == [latest]
+    assert window._current_chosen is None
+    window.close()
+
+
+def test_manual_sanma_mode_and_three_player_table(qapp):
+    from mahjong_jev_advisor.ui_dialogs import ManualStateDialog
+    from mahjong_jev_advisor.state import GameState
+    state = GameState.from_dict({'player_count': 3, 'hand': '19m123456p123s114z'})
+    dialog = ManualStateDialog(state)
+    assert dialog.player_count.currentData() == 3
+    dialog._validate()
+    assert dialog.state.player_count == 3
+    table = FourPlayersRiverWidget()
+    table.update_table(state.scores, state.riichi, state.rivers, state.melds)
+    assert table.rows[3].isHidden()
+    four = GameState()
+    table.update_table(four.scores, four.riichi, four.rivers, four.melds)
+    assert not table.rows[3].isHidden()
+    dialog.close()
+
+
+def test_manual_sanma_riichi_uses_actual_seat(qapp):
+    from mahjong_jev_advisor.ui_dialogs import ManualStateDialog
+    from mahjong_jev_advisor.state import GameState
+    state = GameState.from_dict({'player_count': 3, 'seat': 2, 'hand': '19m123456p123s114z'})
+    dialog = ManualStateDialog(state)
+    assert '自家' in dialog.riichi_checks[2].text()
+    assert '自家' not in dialog.riichi_checks[0].text()
+    dialog.action_buttons.setText('riichi nuki')
+    dialog.riichi_checks[1].setChecked(True)
+    dialog._validate()
+    assert dialog.state.buttons == frozenset({'riichi', 'nuki'})
+    assert dialog.state.riichi == (False, True, False)
+    dialog.close()

@@ -7,7 +7,7 @@ from typing import Any
 
 from .tiles import parse_tiles, validate_physical_tiles, valid
 
-BUTTONS = frozenset({"riichi", "chi", "pon", "kan", "ron", "tsumo", "pass", "kyuushu"})
+BUTTONS = frozenset({"riichi", "chi", "pon", "kan", "ron", "tsumo", "pass", "kyuushu", "nuki"})
 
 
 @dataclass(frozen=True)
@@ -29,13 +29,24 @@ class GameState:
     open_melds: int = 0
     observation_confidence: float = 1.0
 
+    player_count: int = 4
+    nuki: tuple[int, ...] = ()
+
     def validate(self) -> None:
-        if len(self.rivers) != 4 or len(self.melds) != 4 or len(self.scores) != 4 or len(self.riichi) != 4:
-            raise ValueError("A four-player state needs four rivers, meld sets, scores and riichi flags")
-        if not 0 <= self.seat < 4 or self.round_wind not in {"E", "S", "?"} or self.seat_wind not in {"E", "S", "W", "N", "?"}:
+        if self.player_count not in (3, 4):
+            raise ValueError("Player count must be 3 or 4")
+        if any(len(group) != self.player_count for group in (self.rivers, self.melds, self.scores, self.riichi)):
+            raise ValueError("Player data must match player count")
+        if self.nuki and (len(self.nuki) != self.player_count or any(type(n) is not int or not 0 <= n <= 4 for n in self.nuki)):
+            raise ValueError("Invalid extracted North counts")
+        if self.player_count == 4 and (any(self.nuki) or "nuki" in self.buttons):
+            raise ValueError("拔北仅适用于三人麻将")
+        if self.player_count == 3 and ("chi" in self.buttons or self.seat_wind == "N"):
+            raise ValueError("三人麻将不能吃牌，也没有北家")
+        if not 0 <= self.seat < self.player_count or self.round_wind not in {"E", "S", "?"} or self.seat_wind not in {"E", "S", "W", "N", "?"}:
             raise ValueError("Invalid seat or wind")
-        if self.round_number is not None and not 1 <= self.round_number <= 4:
-            raise ValueError("Round number must be from 1 to 4")
+        if self.round_number is not None and not 1 <= self.round_number <= self.player_count:
+            raise ValueError(f"Round number must be from 1 to {self.player_count}")
         if not 0 <= self.open_melds <= 4:
             raise ValueError("Invalid open meld count")
         if any(flag is not None and not isinstance(flag, bool) for flag in self.riichi):
@@ -47,14 +58,17 @@ class GameState:
         all_tiles = list(self.hand) + list(self.dora_indicators)
         for group in self.rivers + self.melds:
             all_tiles.extend(group)
+        all_tiles.extend(["4z"] * sum(self.nuki))
         for tile in all_tiles:
             if not valid(tile):
                 raise ValueError(f"Invalid tile: {tile}")
+        if self.last_discard is not None and not valid(self.last_discard):
+            raise ValueError("Invalid last discard")
+        if self.player_count == 3 and any(t[-1] == "m" and t not in {"1m", "9m"} for t in all_tiles + ([self.last_discard] if self.last_discard else [])):
+            raise ValueError("三人麻将不使用二至八万（含赤五万）")
         # Called tiles are moved from the river into the meld by the state
         # reconstructor, so every visible physical tile is counted once.
         validate_physical_tiles(all_tiles)
-        if self.last_discard is not None and not valid(self.last_discard):
-            raise ValueError("Invalid last discard")
         if self.hand:
             expected = {13 - 3 * self.open_melds, 14 - 3 * self.open_melds}
             if len(self.hand) not in expected:
@@ -65,9 +79,12 @@ class GameState:
         def tile_group(value: Any) -> tuple[str, ...]:
             return parse_tiles(value) if isinstance(value, str) else tuple(value)
 
-        rivers = tuple(tile_group(x) for x in data.get("rivers", [[], [], [], []]))
-        melds = tuple(tile_group(x) for x in data.get("melds", [[], [], [], []]))
+        player_count = int(data.get("player_count", len(data.get("scores", data.get("rivers", [None] * 4)))))
+        rivers = tuple(tile_group(x) for x in data.get("rivers", [[] for _ in range(player_count)]))
+        melds = tuple(tile_group(x) for x in data.get("melds", [[] for _ in range(player_count)]))
         obj = cls(
+            player_count=player_count,
+            nuki=tuple(data.get("nuki", [0] * player_count)),
             hand=tile_group(data.get("hand", [])),
             rivers=rivers,
             melds=melds,
@@ -78,8 +95,8 @@ class GameState:
             round_wind=str(data.get("round_wind", "?")).upper(),
             round_number=int(data["round_number"]) if data.get("round_number") is not None else None,
             seat_wind=str(data.get("seat_wind", "?")).upper(),
-            scores=tuple(int(x) if x is not None else None for x in data.get("scores", [None] * 4)),
-            riichi=tuple(data.get("riichi", [None] * 4)),
+            scores=tuple(int(x) if x is not None else None for x in data.get("scores", [None] * player_count)),
+            riichi=tuple(data.get("riichi", [None] * player_count)),
             honba=int(data.get("honba", 0)),
             sticks=int(data.get("sticks", 0)),
             open_melds=int(data.get("open_melds", 0)),
@@ -98,7 +115,7 @@ class GameState:
             self.hand, self.rivers, self.melds, self.dora_indicators,
             tuple(sorted(self.buttons)), self.last_discard, self.seat,
             self.round_wind, self.round_number, self.seat_wind, self.scores, self.riichi,
-            self.honba, self.sticks, self.open_melds,
+            self.honba, self.sticks, self.open_melds, self.player_count, self.nuki,
         )
 
 

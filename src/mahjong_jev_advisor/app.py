@@ -455,11 +455,11 @@ class MainWindow(QMainWindow):
 
         # Round & Dora info
         dora = state.dora_indicators[0] if state.dora_indicators else ""
-        seat_desc = f"{state.seat + 1}{'东' if state.seat_wind == 'E' else '北'}"
+        seat_desc = f"{state.player_count}人 · {dict(E='东', S='南', W='西', N='北').get(state.seat_wind, '?')}家"
         self.round_bar.set_round_info(
             round_wind=state.round_wind,
             round_num=state.round_number or 1,
-            remaining_tiles=max(0, 70 - sum(len(r) for r in state.rivers)),
+            remaining_tiles=max(0, (55 if state.player_count == 3 else 70) - sum(len(r) for r in state.rivers) - sum(state.nuki)),
             seat_desc=seat_desc,
             honba=state.honba,
             sticks=state.sticks,
@@ -665,7 +665,7 @@ class MainWindow(QMainWindow):
         self._current_chosen = None
         self.hero_card.update_decision(action_name="请求中", rec_tile="", shanten_num=None,
             confidence=None, probabilities=[], alternatives=[], source_note="等待真实模型响应",
-            raw_detail=f"模型：{self.settings.model_name}；超时上限 {self.settings.model_timeout:g} 秒")
+            raw_detail=f"模型：{self.settings.model_name}；单次超时 {self.settings.model_timeout:g} 秒，临时故障最多自动重试 2 次")
         self._active_connection_revision = self._connection_revision
         self.active_advice_identity = state.identity()
         worker = AdviceWorker(state, self.settings.api_key, self.settings.connection())
@@ -804,10 +804,15 @@ class MainWindow(QMainWindow):
             self._hook_active = True
             self.timer.stop()
         identity = state.identity()
-        if identity == self.advised_identity or self.advice_busy:
-            return
+        if identity != self.pending_identity:
+            self._current_chosen = None
+            self.hero_card.update_decision(action_name="等待建议", rec_tile="", shanten_num=None,
+                confidence=None, probabilities=[], alternatives=[], source_note="牌局已更新",
+                raw_detail="正在处理最新局面")
         self.pending_identity = identity
         self.stable_count = 2
+        if identity == self.advised_identity or self.advice_busy:
+            return
         self.advised_identity = None
         self.start_advice(state)
 

@@ -99,3 +99,10 @@ def test_calibrated_synthetic_frame_recovers_complete_hand(tmp_path):
     assert observation.state.hand == tuple(TILES[:13]) + ("5p",)
     assert observation.state.dora_indicators == ("7p",)
     assert observation.confidence > 0.99
+
+
+def test_english_riichi_does_not_enable_chi():
+    from mahjong_jev_advisor.vision import parse_buttons
+    assert parse_buttons('riichi') == frozenset({'riichi'})
+    assert parse_buttons('riichi nuki') == frozenset({'riichi', 'nuki'})
+    assert parse_buttons('chi pon') == frozenset({'chi', 'pon', 'pass'})

@@ -37,6 +37,7 @@ def _visible(state: GameState) -> list[int]:
         all_tiles.extend(river)
     for meld in state.melds:
         all_tiles.extend(meld)
+    all_tiles.extend(["4z"] * sum(state.nuki))
     return counts34(all_tiles)
 
 
@@ -47,6 +48,8 @@ def ukeire_details(tiles_after_discard: tuple[str, ...], state: GameState) -> tu
     total = 0
     improving: list[str] = []
     for i, tile in enumerate(TILES):
+        if state.player_count == 3 and tile[-1] == "m" and tile not in {"1m", "9m"}:
+            continue
         remaining = max(0, 4 - visible[i])
         if remaining == 0 or hand_counts[i] >= 4:
             continue
@@ -85,7 +88,7 @@ def danger(tile: str, state: GameState) -> int:
             return 1  # 3 visible = 1 remaining, only tanki wait possible
         if vis_count == 2:
             return 2
-        dora_extra = 2 if t_norm in {dora_from_indicator(x) for x in state.dora_indicators} else 0
+        dora_extra = 2 if t_norm in {dora_from_indicator(x, state.player_count) for x in state.dora_indicators} else 0
         return 3 + dora_extra + len(threats) - 1
 
     # Number tiles (数牌) Suji analysis
@@ -134,14 +137,16 @@ def danger(tile: str, state: GameState) -> int:
         # Non-suji (无筋)
         score = 3 if n in (1, 9) else (4 if n in (2, 8) else 5)
 
-    if t_norm in {dora_from_indicator(x) for x in state.dora_indicators}:
+    if t_norm in {dora_from_indicator(x, state.player_count) for x in state.dora_indicators}:
         score += 2
     return score + len(threats) - 1
 
 
-def dora_from_indicator(tile: str) -> str:
+def dora_from_indicator(tile: str, player_count: int = 4) -> str:
     tile = normal(tile)
     n, suit = int(tile[0]), tile[1]
+    if player_count == 3 and suit == "m":
+        return "9m" if n == 1 else "1m"
     if suit != "z":
         return f"{1 if n == 9 else n + 1}{suit}"
     if n <= 4:
@@ -151,7 +156,7 @@ def dora_from_indicator(tile: str) -> str:
 
 def dora_value(tile: str, state: GameState) -> int:
     return int(tile[0] == "0") + sum(
-        normal(tile) == dora_from_indicator(indicator) for indicator in state.dora_indicators
+        normal(tile) == dora_from_indicator(indicator, state.player_count) for indicator in state.dora_indicators
     )
 
 
@@ -232,7 +237,7 @@ def _discard_candidates(state: GameState) -> list[Candidate]:
             potential_yaku=potential_yaku,
             expected_han=expected_han,
         ))
-    threatened = any(state.riichi[i] for i in range(4) if i != state.seat)
+    threatened = any(state.riichi[i] for i in range(state.player_count) if i != state.seat)
     if threatened:
         scored.sort(key=lambda c: (c.danger, c.shanten, -c.ukeire, c.dora_loss, index(c.tile)))
     else:
@@ -262,6 +267,10 @@ def _discard_candidates(state: GameState) -> list[Candidate]:
         top.append(Candidate("kyuushu", None, "九种九牌流局", "当前界面允许九种九牌流局"))
     if "kan" in state.buttons:
         top.append(Candidate("kan", None, "杠", "当前界面允许杠；需在游戏内确认杠牌组合"))
+    if "nuki" in state.buttons:
+        if "4z" not in state.hand:
+            raise UncertainState("拔北按钮与手牌矛盾")
+        top.append(Candidate("nuki", "4z", "拔北", "拔北增加宝牌并补摸，不破坏门清；留意北的对子、国士用途及抢北风险"))
     return top
 
 
@@ -376,11 +385,18 @@ def local_choice(options: tuple[Candidate, ...], state: GameState | None = None)
         return options[0]
     if options[0].action in {"ron", "tsumo"}:
         return options[0]
+    nuki = next((item for item in options if item.action == "nuki"), None)
+    if nuki and state.hand.count("4z") == 1 and not any(state.riichi):
+        rest = list(state.hand)
+        rest.remove("4z")
+        best_shanten = min((c.shanten for c in options if c.shanten is not None), default=99)
+        if shanten(tuple(rest), state.open_melds) <= best_shanten:
+            return nuki
     abort = next((item for item in options if item.action == "kyuushu"), None)
     if abort is not None and shanten(state.hand, state.open_melds) >= 5:
         return abort
     riichi = [item for item in options if item.action == "riichi"]
-    threatened = any(state.riichi[i] for i in range(4) if i != state.seat)
+    threatened = any(state.riichi[i] for i in range(state.player_count) if i != state.seat)
     if riichi and not threatened:
         best = max(riichi, key=lambda item: (item.ukeire or 0, -(item.danger or 0)))
         if (best.ukeire or 0) >= 4:
