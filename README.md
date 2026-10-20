@@ -4,7 +4,7 @@
 
 **在牌桌旁查看切牌建议、进张分析与攻守思路。**
 
-面向雀魂网页版的 Python / PySide6 桌面顾问，支持四人麻将与三人麻将。
+面向雀魂的 Python / PySide6 桌面顾问：网页版支持四人 / 三人麻将，Steam 客户端提供实验性截图接入。
 
 [![Cross-platform checks](https://github.com/PaoPao1021/mahjong-jev-advisor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/PaoPao1021/mahjong-jev-advisor/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
@@ -58,6 +58,7 @@
 | 深度解析 | 通过单独配置的聊天模型，解释当前推荐动作与攻守思路 |
 | 实时数据 | 浏览器 Hook 自动接收牌局事件，支持状态更新与重连恢复 |
 | 备用输入 | 手动录入；四人布局的截图、模板匹配与 OCR 识别 |
+| Steam 客户端（实验性） | 独立截图模式；Windows 绑定并跟踪游戏窗口，macOS 手动框选；三人局需手动录入 |
 | 请求恢复 | 临时网络故障最多重试两次；旧请求结束后继续处理最新局面 |
 | 桌面界面 | 手牌高亮、牌河展示、窗口缩放、透明度调整 |
 
@@ -226,6 +227,23 @@ zsh run_macos.sh
 
 `seat` 从 0 开始；玩家数组使用实际座位顺序，长度应与人数一致。`nuki` 是各玩家已拔出的北牌数量。示例中的 `nuki` 按钮假定当前游戏允许拔北。
 
+### Steam 客户端（实验性）
+
+**此功能已加入当前源码，v0.1.0 发布包不包含。** 按上方源码方式更新并启动；下载旧发布包不会出现 Steam 菜单。[Steam 雀魂商店页](https://store.steampowered.com/app/1329410/MahjongSoul/)。
+
+Steam 模式通过屏幕截图、牌面模板与 OCR 获取信息，再使用同一套候选生成和 Jev 建议引擎。它不需要浏览器扩展。当前支持 **四人布局的实验性连续识别，以及三人 / 四人的手动输入**；尚未完成真实 Steam 对局验收，不能保证开箱即用或达到网页版 Hook 的准确度。上方两张演示均来自网页版。
+
+1. 启动 Steam 雀魂，进入牌局并保持**窗口化、可见且无遮挡**。先完成顾问的【Jev设置】和连接测试。
+2. 在顾问点击 **【桌】→【输入来源】→【Steam 客户端（截图）】**。切换后停止原来的识别并清除旧建议；后台网页事件不会写入 Steam 局面。
+3. **Windows：** 点击【桌】→【绑定 Steam 雀魂窗口（Windows）】，选择游戏窗口。程序只取客户区，移动窗口后自动更新采集位置。找不到窗口时，使用【选择牌桌画面】手动框选。
+4. **macOS：** 使用【桌】→【选择牌桌画面】，只框选完整游戏画面；为运行顾问的应用或终端开启系统屏幕录制权限。手动框选后移动窗口，需要重新框选。
+5. 点击【开始识别】尝试自动定位，按提示核对当前手牌。自动定位失败时，用【基础区域校准】标记手牌、摸牌与操作按钮，再通过【手动核对】学习牌面。使用【扩展区域校准】补充牌河、宝牌、点数等区域；模板未覆盖的牌需要继续标注。
+6. 对照游戏检查手牌、可见按钮和局况。识别不准时暂停，使用【手动核对】修正；**截图路径的局风、自风及副露等信息可能不完整**。三人局在核对窗口选择三人麻将，每次局面变化后重新录入；三人手动状态不会恢复四人截图识别。
+
+窗口绑定仅在本次运行有效。下次启动请确认采集范围或重新绑定；重新绑定 / 框选会清除当前模式的区域校准。自动绑定后，游戏窗口缩放会停止识别并要求重新校准；最小化或关闭时清除当前局面与建议，恢复可见后重新采集，重启游戏后需重新绑定。
+
+浏览器与 Steam 分别保存采集范围、区域校准和模板；模型 Key 共用。截图采集无法识别所有遮挡，也不支持后台 / 最小化采集；请关闭覆盖牌桌的其他窗口或 Steam 浮层。全屏、混合 DPI、游戏皮肤和动画场景仍需实际验证。
+
 ### 截图识别：四人局备用方式
 
 无法使用网页 Hook 时，可以尝试截图识别：
@@ -330,7 +348,7 @@ python -m mahjong_jev_advisor.preflight --online --output readiness-report.json
 | macOS | `~/Library/Application Support/mahjong-jev-advisor/` |
 | 其他系统 | `${XDG_CONFIG_HOME:-~/.config}/mahjong-jev-advisor/` |
 
-目录中可能包含 `settings.json`、牌面模板 `templates/`，以及启用决策日志后生成的 `decisions.jsonl`。损坏配置重新保存时会备份为 `settings.invalid.json`。可用 `MAHJONG_ADVISOR_CONFIG_DIR` 指向独立目录进行开发或测试。
+目录中可能包含 `settings.json`、浏览器牌面模板 `templates/`、Steam 模板 `templates-steam/`，以及启用决策日志后生成的 `decisions.jsonl`。损坏配置重新保存时会备份为 `settings.invalid.json`。可用 `MAHJONG_ADVISOR_CONFIG_DIR` 指向独立目录进行开发或测试。
 
 数据流与凭据处理：
 
@@ -384,7 +402,7 @@ python3.12 -m venv .venv
 .venv/bin/python -m mahjong_jev_advisor.replay --states tests/fixtures/states.jsonl
 ```
 
-测试覆盖状态校验、四麻与三麻规则、Hook 解码及恢复、协议解析、真实本机 HTTP 往返、临时失败重试、Qt 后台任务与界面更新。测试使用隔离配置目录，避免修改真实用户设置。
+测试覆盖状态校验、四麻与三麻规则、Hook 解码及恢复、协议解析、真实本机 HTTP 往返、临时失败重试、Qt 后台任务与界面更新，以及输入模式隔离、窗口失效、位置变化和过期截图处理。Windows 另有真实 Win32 测试窗口的枚举、移动与关闭检查；这些测试不能替代 Steam 游戏对局验收。测试使用隔离配置目录，避免修改真实用户设置。
 
 CI 在 Windows 和 macOS 上安装项目、运行 pytest 和 JSONL 回放，最新结果见 [Actions](https://github.com/PaoPao1021/mahjong-jev-advisor/actions/workflows/ci.yml)。本机 HTTP 测试不依赖付费模型账户，也不能证明外部服务当前可用；状态回放耗时不包含屏幕识别或远程模型耗时。
 
@@ -431,6 +449,7 @@ mahjong-jev-advisor/
 │   ├── jev.py                  # 在线决策协议、结果校验与重试
 │   ├── llm.py                  # 聊天模型深度解析
 │   ├── vision.py               # 截图、OCR、模板识别与学习
+│   ├── desktop_capture.py      # Windows 雀魂窗口发现与客户区定位
 │   ├── ui_*.py                 # 牌面绘制、界面组件与设置对话框
 │   ├── settings.py             # 用户配置与可选决策日志
 │   ├── preflight.py            # 本机及在线自检
@@ -456,9 +475,9 @@ mahjong-jev-advisor/
 
 欢迎通过 [Issues](https://github.com/PaoPao1021/mahjong-jev-advisor/issues) 报告问题或讨论功能，通过 Pull Request 提交改进。
 
-报告问题时请提供：系统与 Python 版本、当前提交、三人或四人玩法、Hook 或截图输入方式、复现步骤、预期与实际结果，以及脱敏后的错误信息。Hook 问题可附诊断面板；牌理问题可附最小状态 JSON。不要提交 API Key、完整用户配置或带凭据的原始网络数据。
+报告问题时请提供：系统与 Python 版本、当前提交、三人或四人玩法、网页 Hook、Steam 或截图输入方式、复现步骤、预期与实际结果，以及脱敏后的错误信息。Hook 问题可附诊断面板；牌理问题可附最小状态 JSON。不要提交 API Key、完整用户配置或带凭据的原始网络数据。
 
-提交改动前，请运行 pytest 和回放命令。行为修复应附可复现的回归用例；协议或状态结构变更应兼顾四麻、三麻和重连恢复。适合参与的方向包括复杂副露建模、三麻计分、视觉识别适配与测试样本补充。
+提交改动前，请运行 pytest 和回放命令。行为修复应附可复现的回归用例；协议或状态结构变更应兼顾四麻、三麻和重连恢复。适合参与的方向包括复杂副露建模、三麻计分、视觉识别适配与测试样本补充。Steam 路径尤其需要不同分辨率、缩放及牌面样式的脱敏截图和人工核对结果。
 
 ## 致谢与许可证
 

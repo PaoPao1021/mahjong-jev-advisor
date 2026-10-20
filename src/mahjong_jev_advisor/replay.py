@@ -26,7 +26,7 @@ from .jev import JevError, advise
 from .rules import NoDecision, UncertainState, candidates, local_choice
 from .settings import Settings
 from .state import Advice, GameState
-from .vision import VisionReader
+from .vision import TemplateStore, VisionReader
 
 
 def percentile_95(values: list[float]) -> float:
@@ -45,7 +45,7 @@ def _states(path: Path):
 
 
 def _frames(path: Path, settings: Settings):
-    reader = VisionReader(settings.regions)
+    reader = VisionReader(settings.regions, TemplateStore(settings.template_dir()))
     for file in sorted([*path.glob("*.png"), *path.glob("*.jpg")]):
         frame = cv2.imread(str(file))
         if frame is None:

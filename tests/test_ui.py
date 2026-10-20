@@ -342,3 +342,112 @@ def test_manual_sanma_riichi_uses_actual_seat(qapp):
     assert dialog.state.buttons == frozenset({'riichi', 'nuki'})
     assert dialog.state.riichi == (False, True, False)
     dialog.close()
+
+
+def test_input_switch_ignores_queued_hook_and_capture(qapp, monkeypatch):
+    window = MainWindow()
+    try:
+        old_generation = window._capture_generation
+        window.settings.game_box = (0, 0, 800, 600)
+        old_templates = window.templates.path
+        window.set_input_source("steam")
+        assert not window.running and not window.timer.isActive()
+        assert window.settings.game_box is None
+        assert window.templates.path != old_templates
+        window.on_hook_state(_demo_reference_state())
+        window.on_hook_status("connected")
+        assert not window.last_state.hand and not window._hook_active
+        received = []
+        monkeypatch.setattr(window, "on_observation", received.append)
+        window._on_capture_result(object(), old_generation)
+        assert not received
+        window.set_input_source("browser")
+        assert window.settings.game_box == (0, 0, 800, 600)
+        assert window.templates.path == old_templates
+    finally:
+        window.close()
+
+
+def test_steam_window_moves_resize_minimize_and_stale_results(qapp, monkeypatch):
+    from mahjong_jev_advisor import app as module
+    from mahjong_jev_advisor.desktop_capture import GameWindow, WindowUnavailable
+    from mahjong_jev_advisor.settings import Settings
+    Settings(input_source="steam").save()
+    window = MainWindow()
+    try:
+        assert not window.hook.connected and not window.running
+        window._steam_window = GameWindow(42, 100, "雀魂")
+        window.settings.game_box = (0, 0, 800, 600)
+        window.settings.regions = {"hand": (0.1, 0.8, 0.7, 0.1)}
+        window.running = True
+        box = [(10, 20, 800, 600)]
+        monkeypatch.setattr(module, "client_box", lambda target: box[0])
+        received = []
+        monkeypatch.setattr(window, "on_observation", received.append)
+        generation = window._capture_generation
+        window._on_capture_result("old-location", generation)
+        assert not received and window.settings.game_box == box[0]
+        assert window.settings.regions and window.running
+        window._on_capture_result("current-location", window._capture_generation)
+        assert received == ["current-location"]
+        box[0] = (10, 20, 1000, 700)
+        window._on_capture_result("old-size", window._capture_generation)
+        assert received == ["current-location"]
+        assert not window.settings.regions and not window.running
+        window.last_state = _demo_reference_state()
+        def minimized(target):
+            raise WindowUnavailable("已最小化")
+        monkeypatch.setattr(module, "client_box", minimized)
+        assert not window._update_steam_window()
+        assert not window.last_state.hand and window._current_chosen is None
+    finally:
+        window.close()
+
+
+def test_steam_manual_sanma_never_resumes_four_player_reader(qapp, monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QDialog
+    from mahjong_jev_advisor import app as module
+    from mahjong_jev_advisor.settings import Settings
+    from mahjong_jev_advisor.state import GameState
+    Settings(input_source="steam").save()
+    window = MainWindow()
+    state = GameState.from_dict({"player_count": 3, "hand": "19m123456p123s114z"})
+    dialog = SimpleNamespace(state=state, learn_and_resume=SimpleNamespace(isChecked=lambda: True),
+                             exec=lambda: QDialog.DialogCode.Accepted)
+    monkeypatch.setattr(module, "ManualStateDialog", lambda *args: dialog)
+    monkeypatch.setattr(window, "_start_latest_if_needed", lambda: None)
+    notices = []
+    monkeypatch.setattr(module.QMessageBox, "information", lambda *args: notices.append(args))
+    try:
+        window.manual_state(force_resume=True)
+        assert window.manual and not window.running and window.last_state == state
+        window.toggle_recognition()
+        assert notices and window.manual and not window.running
+    finally:
+        window.close()
+
+
+def test_steam_capture_worker_delivers_on_gui_thread(qapp, monkeypatch):
+    import numpy as np
+    from PySide6.QtCore import QThread
+    from types import SimpleNamespace
+    from mahjong_jev_advisor import app as module
+    from mahjong_jev_advisor.settings import Settings
+    from mahjong_jev_advisor.vision import Observation
+    Settings(input_source="steam", game_box=(0, 0, 800, 600)).save()
+    window = MainWindow()
+    result = Observation(_demo_reference_state(), 0.99, (), {})
+    window.reader = SimpleNamespace(analyze=lambda frame, seat: result)
+    monkeypatch.setattr(module, "capture_box", lambda box: np.zeros((10, 10, 3), dtype=np.uint8))
+    received = []
+    monkeypatch.setattr(window, "on_observation", lambda obs: received.append((obs, QThread.currentThread())))
+    window._capture_excluded = True
+    window.running = True
+    try:
+        window.capture_tick()
+        wait_for_ui(qapp, lambda: bool(received))
+        assert received == [(result, qapp.thread())]
+        assert not window.capture_busy
+    finally:
+        window.close()

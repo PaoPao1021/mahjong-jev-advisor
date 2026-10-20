@@ -30,6 +30,8 @@ def config_dir() -> Path:
 class Settings:
     game_box: tuple[int, int, int, int] | None = None
     regions: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
+    input_source: str = "browser"
+    capture_profiles: dict[str, Any] = field(default_factory=dict)
     api_key: str = ""
     model_endpoint: str = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model"
     model_name: str = "typesafe-ai/jev-latest"
@@ -65,6 +67,8 @@ class Settings:
         }.get((protocol, f"{urlsplit(endpoint).scheme}://{urlsplit(endpoint).netloc}"))
 
         return cls(
+            input_source=data.get("input_source", "browser"),
+            capture_profiles=data.get("capture_profiles", {}),
             game_box=tuple(data["game_box"]) if data.get("game_box") else None,
             regions={k: tuple(v) for k, v in data.get("regions", {}).items()},
             # Old api_key entries were TypeSafe credentials and must not be sent to Vercel.
@@ -87,6 +91,15 @@ class Settings:
     def _validate_data(data: Any) -> None:
         if not isinstance(data, dict):
             raise ValueError("Configuration must be an object")
+        if data.get("input_source", "browser") not in {"browser", "steam"}:
+            raise ValueError("Invalid input source")
+        profiles = data.get("capture_profiles", {})
+        if not isinstance(profiles, dict) or profiles.keys() - {"browser", "steam"}:
+            raise ValueError("Invalid capture profiles")
+        for profile in profiles.values():
+            if not isinstance(profile, dict) or profile.keys() - {"game_box", "regions"}:
+                raise ValueError("Invalid capture profile")
+            Settings._validate_data(profile)
         for key in ("gateway_api_key", "model_endpoint", "model_name", "model_protocol", "llm_base_url", "llm_api_key", "llm_model"):
             if key in data and not isinstance(data[key], str):
                 raise ValueError("Invalid text field")
@@ -116,6 +129,8 @@ class Settings:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "settings.json"
         data = {
+            "input_source": self.input_source,
+            "capture_profiles": self.capture_profiles,
             "game_box": self.game_box,
             "regions": self.regions,
             "gateway_api_key": self.api_key,
@@ -156,6 +171,22 @@ class Settings:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    def switch_input_source(self, source: str) -> None:
+        if source not in {"browser", "steam"}:
+            raise ValueError("Invalid input source")
+        if source == self.input_source:
+            return
+        self.capture_profiles[self.input_source] = {
+            "game_box": self.game_box, "regions": dict(self.regions),
+        }
+        profile = self.capture_profiles.get(source, {})
+        self.game_box = tuple(profile["game_box"]) if profile.get("game_box") else None
+        self.regions = {key: tuple(value) for key, value in profile.get("regions", {}).items()}
+        self.input_source = source
+
+    def template_dir(self) -> Path:
+        return config_dir() / ("templates-steam" if self.input_source == "steam" else "templates")
 
     def connection(self):
         from .jev import ModelConnection

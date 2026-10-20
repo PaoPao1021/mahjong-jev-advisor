@@ -34,8 +34,11 @@ def inspect(*, online: bool = False, capture: bool = True) -> dict:
     settings = Settings.load()
     extension = extension_dir()
     hook_files = all((extension / name).is_file() for name in ("manifest.json", "content.js", "page-hook.js"))
-    add("网页 Hook", "ok" if hook_files else "blocked",
-        "扩展文件齐全；需在 Edge/Chrome 加载后刷新雀魂" if hook_files else "浏览器扩展文件缺失")
+    browser = settings.input_source == "browser"
+    add("输入来源", "ok", "浏览器" if browser else "Steam 截图（四人布局）")
+    if browser:
+        add("网页 Hook", "ok" if hook_files else "blocked",
+            "扩展文件齐全；需在 Edge/Chrome 加载后刷新雀魂" if hook_files else "浏览器扩展文件缺失")
     add("配置文件", "blocked" if settings.load_warning else "ok", settings.load_warning or "可读取；诊断报告不含 Key")
     try:
         settings.connection().validate()
@@ -43,15 +46,15 @@ def inspect(*, online: bool = False, capture: bool = True) -> dict:
     except Exception:
         add("模型配置", "blocked", "地址、模型或协议无效，请打开 Jev 设置修正")
     add("API Key", "ok" if settings.api_key.strip() else "blocked", "已配置（隐藏）" if settings.api_key.strip() else "未配置")
-    add("牌桌范围", "ok" if settings.game_box else "blocked", "已选择；移动浏览器后需重新选择" if settings.game_box else "在【桌】选择牌桌画面")
+    add("牌桌范围", "ok" if settings.game_box else "blocked", "已选择；手动框选后移动游戏窗口需重新选择" if settings.game_box else "在【桌】选择牌桌画面")
     missing = [label for name, label, _, _, required in REGIONS if required and name not in settings.regions]
     add("基础校准", "blocked" if missing else "ok", "缺少：" + "、".join(missing) if missing else "已保存手牌、摸牌、按钮区域")
     missing_extra = [label for name, label, _, _, required in REGIONS if not required and name not in settings.regions]
     add("扩展校准", "warning" if missing_extra else "ok", "尚未校准：" + "、".join(missing_extra) if missing_extra else "全部区域已配置")
-    labels = {label for label, _ in TemplateStore().samples}
+    labels = {label for label, _ in TemplateStore(settings.template_dir()).samples}
     missing_tiles = sorted(set(TEMPLATE_LABELS) - labels)
-    add("牌面模板", "warning" if missing_tiles and hook_files else "blocked" if missing_tiles else "ok",
-        (f"屏幕备用识别已覆盖 {len(labels)}/{len(TEMPLATE_LABELS)} 类；网页 Hook 模式无需补齐。缺少：{' '.join(missing_tiles)}"
+    add("牌面模板", "warning" if missing_tiles and browser and hook_files else "blocked" if missing_tiles else "ok",
+        (f"屏幕备用识别已覆盖 {len(labels)}/{len(TEMPLATE_LABELS)} 类；截图模式需继续学习；网页 Hook 无需模板。缺少：{' '.join(missing_tiles)}"
          if missing_tiles else "牌种和空格模板齐全；实际识别仍需牌桌验证"))
     try:
         from rapidocr_onnxruntime import RapidOCR

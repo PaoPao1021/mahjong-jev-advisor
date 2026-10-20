@@ -20,9 +20,10 @@ from PySide6.QtCore import QEvent, QPoint, QRect, QRunnable, Qt, QThreadPool, QT
 from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QLayout, QMainWindow, QMenu, QMessageBox,
-    QScrollArea, QVBoxLayout, QWidget,
+    QScrollArea, QVBoxLayout, QWidget, QInputDialog,
 )
 
+from .desktop_capture import GameWindow, WindowUnavailable, client_box, game_windows
 from .jev import JevError, advise
 from .hook import HookBridge
 from .rules import (
@@ -85,19 +86,26 @@ class TaskSignals(QObject):
     failed = Signal(object)
 
 
+class CaptureSignals(QObject):
+    captured = Signal()
+    done = Signal(object, int)
+    failed = Signal(str, int)
+
+
 class CaptureWorker(QRunnable):
-    def __init__(self, box: tuple[int, int, int, int], reader: VisionReader, seat: int):
+    def __init__(self, box: tuple[int, int, int, int], reader: VisionReader, seat: int, generation: int = 0):
         super().__init__()
         self.box, self.reader, self.seat = box, reader, seat
-        self.signals = TaskSignals()
+        self.generation = generation
+        self.signals = CaptureSignals()
 
     def run(self) -> None:
         try:
             frame = capture_box(self.box)
             self.signals.captured.emit()
-            self.signals.done.emit(self.reader.analyze(frame, self.seat))
+            self.signals.done.emit(self.reader.analyze(frame, self.seat), self.generation)
         except Exception:
-            self.signals.failed.emit(traceback.format_exc(limit=3))
+            self.signals.failed.emit(traceback.format_exc(limit=3), self.generation)
 
 
 class AdviceWorker(QRunnable):
@@ -157,7 +165,9 @@ class MainWindow(QMainWindow):
 
         self.settings = Settings.load()
         self._capture_excluded = False
-        self.templates = TemplateStore()
+        self._capture_generation = 0
+        self._steam_window: GameWindow | None = None
+        self.templates = TemplateStore(self.settings.template_dir())
         self.reader = VisionReader(self.settings.regions, self.templates)
         self.hook = HookBridge()
         self.hook.signals.state.connect(self.on_hook_state)
@@ -263,11 +273,16 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.capture_tick)
 
         self.clear_state()
-        self.hook.start()
+        if self.settings.input_source == "browser":
+            self.hook.start()
 
         # If game_box is configured, automatically start real-time monitoring
-        if self.settings.game_box and all(name in self.settings.regions for name in ("hand", "draw", "buttons")):
-            QTimer.singleShot(300, self.toggle_recognition)
+        if self.settings.input_source == "browser" and self.settings.game_box and all(name in self.settings.regions for name in ("hand", "draw", "buttons")):
+            generation = self._capture_generation
+            QTimer.singleShot(300, lambda: self.toggle_recognition()
+                              if self.settings.input_source == "browser" and generation == self._capture_generation else None)
+        elif self.settings.input_source == "steam":
+            self.bottom_bar.set_status_info("Steam 截图模式 · 四人布局", "请确认当前牌桌位置或重新绑定窗口，再点击开始识别；三人局请手动核对")
         elif self.settings.game_box:
             self.title_bar.set_status("待校准", "warning")
             self.bottom_bar.set_status_info("牌桌已选择，识别未就绪", "请在【桌】完成基础校准和牌面样本标注")
@@ -404,6 +419,14 @@ class MainWindow(QMainWindow):
 
     def _on_table_menu(self) -> None:
         menu = QMenu(self)
+        source_menu = menu.addMenu("输入来源")
+        for source, label in (("browser", "浏览器（Hook 优先）"), ("steam", "Steam 客户端（截图）")):
+            action = source_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self.settings.input_source == source)
+            action.triggered.connect(lambda checked=False, value=source: self.set_input_source(value))
+        menu.addAction("绑定 Steam 雀魂窗口（Windows）", self.bind_steam_window)
+        menu.addSeparator()
         menu.addAction("打开网页 Hook 扩展目录", self.open_hook_extension)
         menu.addAction("查看网页 Hook 诊断", self.show_hook_diagnostic)
         menu.addSeparator()
@@ -423,6 +446,93 @@ class MainWindow(QMainWindow):
         ]:
             op_menu.addAction(title, lambda v=val: self._select_opacity(v))
         menu.exec(self.title_bar.btn_table.mapToGlobal(QPoint(0, self.title_bar.btn_table.height() + 2)))
+
+    def set_input_source(self, source: str) -> None:
+        if source == self.settings.input_source:
+            return
+        self.running = False
+        self.manual = False
+        self.timer.stop()
+        self._hook_active = False
+        self._steam_window = None
+        self._capture_generation += 1
+        self._connection_revision += 1  # Invalidate advice from the previous input.
+        self.settings.switch_input_source(source)
+        self.settings.save()
+        self.templates = TemplateStore(self.settings.template_dir())
+        self.reader = VisionReader(self.settings.regions, self.templates)
+        self.clear_state()
+        self.bottom_bar.btn_toggle.setText("开始识别")
+        if source == "steam":
+            self.hook.stop()
+            self.bottom_bar.set_status_info("Steam 截图模式 · 四人布局", "先绑定窗口或选择牌桌画面，再校准并核对手牌；三人局请使用手动核对")
+        else:
+            self.hook.start()
+            self.bottom_bar.set_status_info("浏览器模式", "刷新雀魂网页以重新建立 Hook 连接，或使用截图识别")
+
+    def bind_steam_window(self) -> None:
+        try:
+            windows = game_windows()
+            if not windows:
+                raise WindowUnavailable("未找到雀魂游戏窗口，请先运行 Steam 雀魂；也可手动选择牌桌画面")
+            labels = [f"{w.title} · PID {w.pid} · 窗口 {w.handle}" for w in windows]
+            choice, ok = QInputDialog.getItem(self, "绑定 Steam 雀魂窗口", "选择游戏窗口（保持窗口化且无遮挡）：", labels, 0, False)
+            if not ok:
+                return
+            window = windows[labels.index(choice)]
+            box = client_box(window)
+        except WindowUnavailable as error:
+            QMessageBox.information(self, "窗口绑定", str(error))
+            return
+        self.set_input_source("steam")
+        self._steam_window = window
+        self._bind_capture_box(box)
+
+    def _bind_capture_box(self, box: tuple[int, int, int, int]) -> None:
+        self.running = False
+        self.timer.stop()
+        self._capture_generation += 1
+        self._connection_revision += 1
+        self.settings.game_box = box
+        self.settings.regions = {}  # A new target needs calibration, even at the same size.
+        self.settings.save()
+        self.reader = VisionReader({}, self.templates)
+        self.clear_state()
+        self.bottom_bar.btn_toggle.setText("开始识别")
+        self.bottom_bar.set_status_info("已绑定牌桌", "点击开始识别进行校准与手牌核对；请保持游戏可见且无遮挡")
+
+    def _update_steam_window(self) -> bool:
+        if self.settings.input_source != "steam" or self._steam_window is None:
+            return True
+        try:
+            box = client_box(self._steam_window)
+            old = self.settings.game_box
+            if old and box[2:] != old[2:]:
+                self._bind_capture_box(box)
+                self.bottom_bar.set_status_info("游戏窗口大小已改变", "请重新校准后点击开始识别")
+                return False
+            if old and box != old:
+                self._capture_generation += 1
+                self.clear_state()
+            self.settings.game_box = box
+            return True
+        except WindowUnavailable as error:
+            self._capture_generation += 1
+            self.clear_state()
+            self.on_capture_failure(str(error))
+            return False
+
+    def _on_capture_result(self, observation: Observation, generation: int) -> None:
+        self.capture_busy = False
+        if generation != self._capture_generation or not self._update_steam_window():
+            return
+        if generation == self._capture_generation:
+            self.on_observation(observation)
+
+    def _on_capture_error(self, error: str, generation: int) -> None:
+        self.capture_busy = False
+        if generation == self._capture_generation:
+            self.on_capture_failure(error)
 
     def open_hook_extension(self) -> None:
         directory = extension_dir()
@@ -725,6 +835,7 @@ class MainWindow(QMainWindow):
 
     def toggle_recognition(self) -> None:
         if self.running:
+            self._capture_generation += 1
             self.running = False
             self.timer.stop()
             self.bottom_bar.btn_toggle.setText("开始识别")
@@ -732,7 +843,7 @@ class MainWindow(QMainWindow):
             self.bottom_bar.set_status_info("实时监测已暂停", "点击【开始识别】恢复后台监测")
             return
 
-        if self.hook.connected:
+        if self.settings.input_source == "browser" and self.hook.connected:
             # A loopback ping proves only that the extension reached this app.
             # Keep the calibrated screen reader available until the Hook has
             # decoded an actual game state.
@@ -740,6 +851,11 @@ class MainWindow(QMainWindow):
             self._begin_realtime("网页 Hook 已连接 · 正在等待真实牌局数据")
             return
 
+        if self.manual and self.last_state and self.last_state.player_count == 3:
+            QMessageBox.information(self, "三人截图暂不支持", "三人局请继续手动核对；如需四人实时截图，请先在手动核对中改为四人麻将。")
+            return
+        if not self._update_steam_window():
+            return
         if not self.settings.game_box:
             QMessageBox.information(self, "请先选牌桌", "请点击右上角【桌】→【选择牌桌画面】框选雀魂。")
             return
@@ -784,6 +900,8 @@ class MainWindow(QMainWindow):
             self.capture_tick()
 
     def on_hook_status(self, message: str) -> None:
+        if self.settings.input_source == "steam":
+            return
         if message == "网页 Hook 协议已就绪":
             if not self.running:
                 self._begin_realtime("网页 Hook 已注入 · 等待真实牌局事件")
@@ -796,6 +914,8 @@ class MainWindow(QMainWindow):
             self.bottom_bar.set_status_info(message, "网页 Hook 实时诊断")
 
     def on_hook_state(self, state: GameState) -> None:
+        if self.settings.input_source == "steam":
+            return
         self.last_state = state
         self._demo_preview = False
         self._render_state(state)
@@ -823,6 +943,8 @@ class MainWindow(QMainWindow):
             return
         if QApplication.mouseButtons() & Qt.MouseButton.LeftButton or QApplication.activeModalWidget():
             return
+        if not self._update_steam_window():
+            return
         capture_rect = self.geometry()
         if sys.platform == "win32":
             from ctypes.wintypes import RECT
@@ -838,10 +960,11 @@ class MainWindow(QMainWindow):
             self.bottom_bar.set_status_info("窗口遮挡牌桌", "系统不支持排除悬浮窗，请把顾问窗口移到牌桌区域外")
             return
         self.capture_busy = True
-        worker = CaptureWorker(self.settings.game_box, self.reader, 0)
+        worker = CaptureWorker(self.settings.game_box, self.reader, 0, self._capture_generation)
         worker.signals.captured.connect(self._show_after_capture)
-        worker.signals.done.connect(self.on_observation)
-        worker.signals.failed.connect(self.on_capture_failure)
+        # Connect to QObject methods: lambda receivers can disappear with a finished runnable.
+        worker.signals.done.connect(self._on_capture_result)
+        worker.signals.failed.connect(self._on_capture_error)
 
         self.pool.start(worker)
 
@@ -913,20 +1036,19 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self.bottom_bar.btn_toggle.setText("开始识别")
         image, origin = self._capture_without_overlay()
-        dialog = RegionDialog(image, "雀魂浏览器游戏画面", parent=self)
+        dialog = RegionDialog(image, "Steam 雀魂游戏画面" if self.settings.input_source == "steam" else "雀魂浏览器游戏画面", parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         chosen = dialog.selected_original()
         if not chosen:
             return
         x, y, width, height = chosen
-        self.settings.game_box = (x + origin[0], y + origin[1], width, height)
-        self.settings.save()
-        self.bottom_bar.set_status_info("已绑定牌桌", f"{width}×{height} · 校准完成后可开启识别")
-        if not self.running:
-            self.toggle_recognition()
+        self._steam_window = None
+        self._bind_capture_box((x + origin[0], y + origin[1], width, height))
 
     def calibrate(self, full: bool = False) -> None:
+        if not self._update_steam_window():
+            return
         if not self.settings.game_box:
             QMessageBox.information(self, "先选牌桌", "请先框选雀魂游戏画面。")
             return
@@ -950,12 +1072,15 @@ class MainWindow(QMainWindow):
                 continue
             x, y, w, h = box
             regions[name] = (x / frame.shape[1], y / frame.shape[0], w / frame.shape[1], h / frame.shape[0])
+        self._capture_generation += 1
         self.settings.regions = regions
         self.settings.save()
         self.reader = VisionReader(regions, self.templates)
         self.bottom_bar.set_status_info("校准已保存", "可继续标注样本或开启实时识别。")
 
     def label_templates(self) -> None:
+        if not self._update_steam_window():
+            return
         if not self.settings.game_box or not self.settings.regions:
             QMessageBox.information(self, "先校准", "请先选择牌桌并校准区域。")
             return
@@ -965,6 +1090,8 @@ class MainWindow(QMainWindow):
         self.bottom_bar.set_status_info("样本库已更新", f"当前共有 {len(self.templates.samples)} 个样本。")
 
     def save_frame(self) -> None:
+        if not self._update_steam_window():
+            return
         if not self.settings.game_box:
             QMessageBox.information(self, "先选牌桌", "请先选择牌桌。")
             return
@@ -1077,7 +1204,8 @@ class MainWindow(QMainWindow):
     def manual_state(self, training_frame: np.ndarray | None = None, force_resume: bool = False) -> None:
         if training_frame is None and self.settings.game_box:
             try:
-                training_frame = self._capture_without_overlay(self.settings.game_box)
+                if self._update_steam_window():
+                    training_frame = self._capture_without_overlay(self.settings.game_box)
             except Exception:
                 training_frame = None
         if training_frame is not None and not all(
@@ -1090,7 +1218,9 @@ class MainWindow(QMainWindow):
         dialog = ManualStateDialog(self.last_state, self)
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.state is None:
             return
-        resume = force_resume or dialog.learn_and_resume.isChecked()
+        self._capture_generation += 1
+        resume = (force_resume or dialog.learn_and_resume.isChecked()) and dialog.state.player_count == 4
+        # Three-player screenshots are not calibrated by this reader. Keep manual states manual.
         learned = 0
         if resume and training_frame is not None:
             learned = learn_templates_from_state(
