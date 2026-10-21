@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 @pytest.fixture(autouse=True)
 def isolate_user_configuration(tmp_path, monkeypatch):
     """UI tests must never change the real user's credentials or calibration."""
+    monkeypatch.delenv("MAHJONG_ADVISOR_EDITION", raising=False)
     monkeypatch.setenv("MAHJONG_ADVISOR_CONFIG_DIR", str(tmp_path))
     monkeypatch.setattr("mahjong_jev_advisor.settings.config_dir", lambda: tmp_path)
     monkeypatch.setattr("mahjong_jev_advisor.vision.config_dir", lambda: tmp_path)

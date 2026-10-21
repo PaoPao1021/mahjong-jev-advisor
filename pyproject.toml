@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mahjong-jev-advisor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read-only Mahjong Soul screen advisor with Jev via Vercel AI Gateway"
 requires-python = ">=3.12"
 dependencies = [

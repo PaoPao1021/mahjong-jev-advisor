@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QVBoxLayout, QWidget, QInputDialog,
 )
 
+from .edition import launch_edition
 from .desktop_capture import GameWindow, WindowUnavailable, client_box, game_windows
 from .jev import JevError, advise
 from .hook import HookBridge
@@ -160,10 +161,15 @@ def _demo_reference_state() -> GameState:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("雀魂 · Jev 实时切牌顾问")
+        edition_label = {"browser": " · 网页版", "steam": " · Steam 版（实验性）"}.get(launch_edition(), "")
+        self.setWindowTitle("雀魂 · Jev 实时切牌顾问" + edition_label)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
 
         self.settings = Settings.load()
+        edition = launch_edition()
+        if edition:
+            # Recover settings imported from the other edition without mixing calibration.
+            self.settings.switch_input_source(edition)
         self._capture_excluded = False
         self._capture_generation = 0
         self._steam_window: GameWindow | None = None
@@ -419,16 +425,22 @@ class MainWindow(QMainWindow):
 
     def _on_table_menu(self) -> None:
         menu = QMenu(self)
-        source_menu = menu.addMenu("输入来源")
-        for source, label in (("browser", "浏览器（Hook 优先）"), ("steam", "Steam 客户端（截图）")):
-            action = source_menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(self.settings.input_source == source)
-            action.triggered.connect(lambda checked=False, value=source: self.set_input_source(value))
-        menu.addAction("绑定 Steam 雀魂窗口（Windows）", self.bind_steam_window)
+        edition = launch_edition()
+        if not edition:
+            source_menu = menu.addMenu("输入来源")
+            for source, label in (("browser", "浏览器（Hook 优先）"), ("steam", "Steam 客户端（截图）")):
+                action = source_menu.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(self.settings.input_source == source)
+                action.triggered.connect(lambda checked=False, value=source: self.set_input_source(value))
+        else:
+            menu.addAction("网页版" if edition == "browser" else "Steam 版（实验性）").setEnabled(False)
+        if edition != "browser":
+            menu.addAction("绑定 Steam 雀魂窗口（Windows）", self.bind_steam_window)
         menu.addSeparator()
-        menu.addAction("打开网页 Hook 扩展目录", self.open_hook_extension)
-        menu.addAction("查看网页 Hook 诊断", self.show_hook_diagnostic)
+        if edition != "steam":
+            menu.addAction("打开网页 Hook 扩展目录", self.open_hook_extension)
+            menu.addAction("查看网页 Hook 诊断", self.show_hook_diagnostic)
         menu.addSeparator()
         menu.addAction("选择牌桌画面", self.select_game)
         menu.addAction("基础区域校准", lambda: self.calibrate(False))
@@ -448,6 +460,8 @@ class MainWindow(QMainWindow):
         menu.exec(self.title_bar.btn_table.mapToGlobal(QPoint(0, self.title_bar.btn_table.height() + 2)))
 
     def set_input_source(self, source: str) -> None:
+        if launch_edition() and source != launch_edition():
+            return
         if source == self.settings.input_source:
             return
         self.running = False

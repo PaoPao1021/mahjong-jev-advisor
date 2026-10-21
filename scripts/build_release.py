@@ -4,6 +4,7 @@ Run on each target OS using a clean Python 3.12 virtual environment.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -14,41 +15,47 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-NAME = "MahjongJevAdvisor"
 
 
-def build() -> None:
+def build(edition: str) -> None:
+    name = "MahjongJevAdvisor-Web" if edition == "browser" else "MahjongJevAdvisor-Steam"
     if sys.platform not in ("win32", "darwin"):
         raise SystemExit("Portable release builds support Windows and macOS only")
     version = importlib.metadata.version("mahjong-jev-advisor")
     arch = {"amd64": "x64", "x86_64": "x64", "aarch64": "arm64"}.get(platform.machine().lower(), platform.machine().lower())
     system = "windows" if sys.platform == "win32" else "macos"
-    label = f"mahjong-jev-advisor-{version}-{system}-{arch}"
+    label = f"mahjong-jev-advisor-{version}-{edition}-{system}-{arch}"
     stage = ROOT / "dist" / label
-    if stage.exists():
+    if stage.exists() or (ROOT / "dist" / f"{label}.zip").exists() or (ROOT / "dist" / f"{label}.zip.sha256").exists():
         raise SystemExit(f"Output already exists; move or remove it before rebuilding: {stage}")
+    marker = ROOT / "build" / edition / "_edition.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"edition": edition}), encoding="utf-8")
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
-               "--windowed", "--onedir", "--name", NAME,
-               "--distpath", str(stage), "--workpath", str(ROOT / "build" / "freeze"),
+               "--windowed", "--onedir", "--name", name,
+               "--distpath", str(stage), "--workpath", str(ROOT / "build" / "freeze" / edition),
                "--specpath", str(ROOT / "build"), "--paths", str(ROOT / "src"),
                "--add-data", f"{ROOT / 'src/mahjong_jev_advisor/liqi.json'}:mahjong_jev_advisor",
+               "--add-data", f"{marker}:mahjong_jev_advisor",
                "--collect-all", "rapidocr_onnxruntime", "--collect-all", "onnxruntime",
-               "--collect-submodules", "mahjong", "--osx-bundle-identifier", "io.github.paopao1021.mahjong-jev-advisor"]
+               "--collect-submodules", "mahjong", "--osx-bundle-identifier", f"io.github.paopao1021.mahjong-jev-advisor.{edition}"]
     for package in ("PySide6", "opencv-python-headless", "numpy", "mss", "rapidocr-onnxruntime", "mahjong", "mahjong-jev-advisor"):
         command += ["--copy-metadata", package]
     command.append(str(ROOT / "packaging" / "launcher.py"))
     subprocess.run(command, cwd=ROOT, check=True)
     if sys.platform == "darwin":
         # PyInstaller emits both COLLECT and BUNDLE outputs; distribute only .app.
-        shutil.rmtree(stage / NAME)
-        executable = stage / f"{NAME}.app" / "Contents" / "MacOS" / NAME
+        shutil.rmtree(stage / name)
+        executable = stage / f"{name}.app" / "Contents" / "MacOS" / name
         content = stage
     else:
-        executable = stage / NAME / f"{NAME}.exe"
-        content = stage / NAME
-    shutil.copytree(ROOT / "browser-extension", content / "browser-extension",
-                    ignore=shutil.ignore_patterns(".DS_Store", "*.pem", "*.crx"))
-    shutil.copy2(ROOT / "packaging" / "QUICKSTART.txt", content)
+        executable = stage / name / f"{name}.exe"
+        content = stage / name
+    if edition == "browser":
+        shutil.copytree(ROOT / "browser-extension", content / "browser-extension",
+                        ignore=shutil.ignore_patterns(".DS_Store", "*.pem", "*.crx"))
+    shutil.copy2(ROOT / "packaging" / f"QUICKSTART-{edition}.txt", content / "QUICKSTART.txt")
+    shutil.copy2(ROOT / "docs" / f"{edition}.md", content / "USAGE.md")
     shutil.copy2(ROOT / "LICENSE", content)
     licenses = content / "third-party-licenses"
     licenses.mkdir()
@@ -85,4 +92,6 @@ def build() -> None:
 
 
 if __name__ == "__main__":
-    build()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--edition", choices=("browser", "steam"), required=True)
+    build(parser.parse_args().edition)
