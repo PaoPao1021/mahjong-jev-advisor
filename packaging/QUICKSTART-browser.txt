@@ -1,0 +1,14 @@
+雀魂 · Jev 顾问 — 网页版
+
+1. 解压完整文件夹，运行 MahjongJevAdvisor-Web.exe / MahjongJevAdvisor-Web.app。
+   保留 browser-extension 文件夹，不需要安装 Python。
+2. 【Jev设置】填写对应服务商的 Key，测试连接并保存。
+3. Chrome / Edge 扩展页开启开发者模式，加载 browser-extension 文件夹。
+4. 刷新雀魂网页，进入三人或四人牌局，核对识别结果再使用建议。
+   Hook 无需截图校准。建议动作需自行在游戏内执行。
+
+完整安装、更新、排查及官网：打开本包 USAGE.md。
+旧版 v0.1.0 配置沿用；Steam 版另用独立目录，两个版本可并存。
+API Key 本机明文保存，不要分享配置。在线推断可能收费。
+本包未商业签名或 Apple 公证；系统拦截时先核对来源及 SHA256。
+项目：https://github.com/PaoPao1021/mahjong-jev-advisor

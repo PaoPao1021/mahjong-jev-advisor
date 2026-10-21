@@ -24,16 +24,26 @@ def smoke_test(output: Path) -> int:
             from mahjong_jev_advisor.rules import candidates
             from mahjong_jev_advisor.state import GameState
 
-            extension = extension_dir()
-            for name in ("manifest.json", "content.js", "page-hook.js"):
-                if not (extension / name).is_file():
-                    raise RuntimeError(f"Missing extension file: {name}")
+            from mahjong_jev_advisor.edition import launch_edition
+            from mahjong_jev_advisor.settings import Settings
+            edition = launch_edition() or "browser"
+            if Settings.load().input_source != edition:
+                raise RuntimeError("Incorrect initial input source")
+            if edition == "browser":
+                extension = extension_dir()
+                for name in ("manifest.json", "content.js", "page-hook.js"):
+                    if not (extension / name).is_file():
+                        raise RuntimeError(f"Missing extension file: {name}")
             if HookProtocol().decoder is None:
                 raise RuntimeError("Bundled Liqi schema did not load")
             RapidOCR()  # Loads packaged ONNX models and native inference libraries.
             app = QApplication([])
             window = MainWindow()
             try:
+                if window.settings.input_source != edition:
+                    raise RuntimeError("Wrong edition in GUI")
+                if edition == "steam" and window.hook.connected:
+                    raise RuntimeError("Steam edition unexpectedly connected to browser Hook")
                 for count, hand in ((4, "123m456p789s123z55m"), (3, "19m123456p123s114z")):
                     state = GameState.from_dict({"player_count": count, "hand": hand})
                     if not candidates(state):
@@ -46,7 +56,7 @@ def smoke_test(output: Path) -> int:
             finally:
                 window.close()
                 app.processEvents()
-        report = {"ok": True, "checks": ["extension", "liqi", "ocr-models", "four-player", "three-player", "qt-render"]}
+        report = {"ok": True, "edition": edition, "checks": (["extension"] if edition == "browser" else []) + ["edition-default", "liqi", "ocr-models", "four-player", "three-player", "qt-render"]}
         code = 0
     except Exception:
         report, code = {"ok": False, "error": traceback.format_exc()}, 1

@@ -14,6 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest]
+        edition: [browser, steam]
     runs-on: ${{ matrix.os }}
     env:
       PYTHONUTF8: '1'
@@ -35,10 +36,10 @@ jobs:
       - name: Run regression tests
         run: python -m pytest -q
       - name: Build and smoke-test portable app
-        run: python scripts/build_release.py
+        run: python scripts/build_release.py --edition ${{ matrix.edition }}
       - uses: actions/upload-artifact@v4
         with:
-          name: portable-${{ matrix.os }}
+          name: portable-${{ matrix.edition }}-${{ matrix.os }}
           path: |
             dist/*.zip
             dist/*.sha256
@@ -48,7 +49,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-diagnostics-${{ matrix.os }}
+          name: build-diagnostics-${{ matrix.edition }}-${{ matrix.os }}
           path: |
             build/*-smoke.json
             build/freeze/**/warn-*.txt
@@ -76,4 +77,4 @@ jobs:
             gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
           fi
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
-          gh release upload "$RELEASE_TAG" artifacts/*.zip artifacts/*.sha256 --clobber
+          gh release upload "$RELEASE_TAG" artifacts/*.zip artifacts/*.sha256

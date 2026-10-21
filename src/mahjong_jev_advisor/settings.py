@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .edition import default_input_source, launch_edition
+
 
 def config_dir() -> Path:
     override = os.environ.get("MAHJONG_ADVISOR_CONFIG_DIR")
@@ -23,14 +25,14 @@ def config_dir() -> Path:
         base = Path.home() / "Library" / "Application Support"
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "mahjong-jev-advisor"
+    return base / ("mahjong-jev-advisor-steam" if launch_edition() == "steam" else "mahjong-jev-advisor")
 
 
 @dataclass
 class Settings:
     game_box: tuple[int, int, int, int] | None = None
     regions: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
-    input_source: str = "browser"
+    input_source: str = field(default_factory=default_input_source)
     capture_profiles: dict[str, Any] = field(default_factory=dict)
     api_key: str = ""
     model_endpoint: str = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model"
@@ -67,7 +69,7 @@ class Settings:
         }.get((protocol, f"{urlsplit(endpoint).scheme}://{urlsplit(endpoint).netloc}"))
 
         return cls(
-            input_source=data.get("input_source", "browser"),
+            input_source=data.get("input_source", default_input_source()),
             capture_profiles=data.get("capture_profiles", {}),
             game_box=tuple(data["game_box"]) if data.get("game_box") else None,
             regions={k: tuple(v) for k, v in data.get("regions", {}).items()},

@@ -451,3 +451,18 @@ def test_steam_capture_worker_delivers_on_gui_thread(qapp, monkeypatch):
         assert not window.capture_busy
     finally:
         window.close()
+
+
+@pytest.mark.parametrize("edition", ["browser", "steam"])
+def test_edition_entry_uses_own_mode_and_does_not_switch(qapp, monkeypatch, edition):
+    monkeypatch.setenv("MAHJONG_ADVISOR_EDITION", edition)
+    window = MainWindow()
+    try:
+        assert window.settings.input_source == edition
+        assert ("Steam" in window.windowTitle()) == (edition == "steam")
+        window.set_input_source("browser" if edition == "steam" else "steam")
+        assert window.settings.input_source == edition
+        if edition == "steam":
+            assert not window.hook.connected and not window.running
+    finally:
+        window.close()
