@@ -13,15 +13,36 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def release_version() -> str:
+    declared = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    installed = importlib.metadata.version("mahjong-jev-advisor")
+    if installed != declared:
+        raise SystemExit(
+            f"Installed version {installed} differs from source version {declared}; "
+            "reinstall the project with python -m pip install -e '.[dev]' before building"
+        )
+    return declared
+
+
+def verify_frozen_app(executable: Path, report: Path, edition: str) -> None:
+    # A previous successful run must never stand in for this build's report.
+    report.unlink(missing_ok=True)
+    subprocess.run([str(executable), "--smoke-test", str(report)], cwd=ROOT / "build", check=True, timeout=180)
+    result = json.loads(report.read_text(encoding="utf-8"))
+    if result.get("ok") is not True or result.get("edition") != edition:
+        raise SystemExit(f"Frozen smoke test failed for {edition}: {result}")
 
 
 def build(edition: str) -> None:
     name = "MahjongJevAdvisor-Web" if edition == "browser" else "MahjongJevAdvisor-Steam"
     if sys.platform not in ("win32", "darwin"):
         raise SystemExit("Portable release builds support Windows and macOS only")
-    version = importlib.metadata.version("mahjong-jev-advisor")
+    version = release_version()
     arch = {"amd64": "x64", "x86_64": "x64", "aarch64": "arm64"}.get(platform.machine().lower(), platform.machine().lower())
     system = "windows" if sys.platform == "win32" else "macos"
     label = f"mahjong-jev-advisor-{version}-{edition}-{system}-{arch}"
@@ -75,10 +96,7 @@ def build(edition: str) -> None:
                 shutil.copy2(source, target)
     (licenses / "DEPENDENCIES.json").write_text(json.dumps(inventory, indent=2), encoding="utf-8")
     report = ROOT / "build" / f"{label}-smoke.json"
-    subprocess.run([str(executable), "--smoke-test", str(report)], cwd=ROOT / "build", check=True, timeout=180)
-    result = json.loads(report.read_text(encoding="utf-8"))
-    if not result.get("ok"):
-        raise SystemExit(f"Frozen smoke test failed: {result}")
+    verify_frozen_app(executable, report, edition)
     shutil.copy2(report, content / "build-verification.json")
     archive = ROOT / "dist" / f"{label}.zip"
     if sys.platform == "darwin":

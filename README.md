@@ -441,6 +441,8 @@ python scripts/build_release.py --edition steam
 
 Windows PowerShell 也可执行上述命令。产物在 `dist/`，包括带版本、入口（browser / steam）、系统及架构名称的 ZIP 和 SHA256 文件；已有同名目录时先移走旧产物。每个平台需要原生构建，不能在 macOS 上直接生成 Windows EXE。
 
+构建前会核对已安装的项目版本与 `pyproject.toml` 是否一致；修改版本后需重新安装项目，否则会停止打包并提示修复。每次构建必须生成新的冒烟检查报告，报告中的网页版 / Steam 版身份也必须与目标一致，旧报告不能作为本次构建通过的依据。
+
 推荐在 GitHub Actions 的 **Portable release builds → Run workflow** 手动生成候选包。工作流运行回归测试后构建，再执行冻结应用的离线冒烟检查；任一步失败均不会上传可分发包。`build-diagnostics-*` 保存打包诊断。
 
 正式发布时，先修改 `pyproject.toml` 的版本、提交并推送，再推送匹配的 `v<版本号>` 标签。两种入口在两个平台的四个构建均成功后，工作流创建 **Draft Release** 并附上 ZIP 与校验文件；维护者检查后手动发布。标签与项目版本不一致时构建会失败，工作流也不会覆盖已公开 Release 或同名附件。新功能使用独立分支和 PR 审查；不要强制覆盖 main 或旧标签。
