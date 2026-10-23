@@ -386,6 +386,7 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event: Any) -> None:
         super().showEvent(event)
+        self.content_scroll.viewport().installEventFilter(self)
         if not self._screen_bound and self.windowHandle() is not None:
             self.windowHandle().screenChanged.connect(self._on_screen_changed)
             self._screen_bound = True
@@ -611,7 +612,7 @@ class MainWindow(QMainWindow):
         if threats > 0:
             fold_rate = min(95, max(15, 20 + threats * 25 + raw_danger * 5))
         else:
-            fold_rate = max(5, min(40, (chosen.shanten or 1) * 12))
+            fold_rate = max(5, min(40, (chosen.shanten if chosen.shanten is not None else 1) * 12))
 
         opts: list[Candidate] = []
         try:
@@ -715,7 +716,7 @@ class MainWindow(QMainWindow):
             probabilities=bar_items,
             fold_rate=fold_rate,
             danger_score=danger_score,
-            draw_info=f"摸切 {chosen.ukeire or 6}" if rec_tile == (state.hand[-1] if state.hand else "") else "手切",
+            draw_info=f"有效牌 {chosen.ukeire} 张" if chosen.ukeire is not None else "有效牌未知",
             melds_count=state.open_melds,
             alternatives=alternatives_list,
             source_note=source_note,
@@ -850,6 +851,13 @@ class MainWindow(QMainWindow):
     def toggle_recognition(self) -> None:
         if self.running:
             self._capture_generation += 1
+            self.pending_identity = None
+            self.advised_identity = None
+            self.stable_count = 0
+            self._current_chosen = None
+            self.hero_card.update_decision(action_name="已暂停", rec_tile="", shanten_num=None,
+                confidence=None, probabilities=[], alternatives=[], source_note="实时建议已暂停",
+                raw_detail="点击【开始识别】恢复；暂停前的请求结果不会显示。")
             self.running = False
             self.timer.stop()
             self.bottom_bar.btn_toggle.setText("开始识别")
@@ -934,6 +942,12 @@ class MainWindow(QMainWindow):
         self._demo_preview = False
         self._render_state(state)
         if not self.running:
+            self.pending_identity = None
+            self.advised_identity = None
+            self._current_chosen = None
+            self.hero_card.update_decision(action_name="已暂停", rec_tile="", shanten_num=None,
+                confidence=None, probabilities=[], alternatives=[], source_note="实时建议已暂停",
+                raw_detail="已收到新牌面，开始识别后生成当前局面的建议。")
             self.bottom_bar.set_status_info("已捕获牌局状态", "点击【开始识别】开启 AI 自动切牌建议")
             return
         if not self._hook_active:
@@ -1014,6 +1028,7 @@ class MainWindow(QMainWindow):
 
         if observation.problems or observation.state is None or observation.confidence < 0.90:
             self.pending_identity = None
+            self.advised_identity = None
             self.stable_count = 0
             self._current_chosen = None
             self.hero_card.update_decision(action_name="待核对", rec_tile="", shanten_num=None,
@@ -1030,6 +1045,10 @@ class MainWindow(QMainWindow):
             self.pending_identity = identity
             self.stable_count = 1
             self.advised_identity = None
+            self._current_chosen = None
+            self.hero_card.update_decision(action_name="确认牌面", rec_tile="", shanten_num=None,
+                confidence=None, probabilities=[], alternatives=[], source_note="牌面已变化 · 等待稳定识别",
+                raw_detail="连续两次识别一致后，再生成新建议。")
 
         if self.stable_count >= 2 and identity != self.advised_identity and not self.advice_busy:
             self.start_advice(observation.state)
@@ -1203,8 +1222,8 @@ class MainWindow(QMainWindow):
             action_name="模拟切牌",
             rec_tile=tile,
             shanten_num=s,
-            confidence=1.0,
-            probabilities=[(tile, 85, True)],
+            confidence=None,
+            probabilities=[],
             fold_rate=fold_rate,
             danger_score=danger_score,
             draw_info="手动模拟",
@@ -1256,6 +1275,8 @@ class MainWindow(QMainWindow):
             self._begin_realtime(f"已学习 {learned} 个当前牌面样本 · 后续变化自动识别")
 
     def closeEvent(self, event: Any) -> None:
+        # Detach Python callbacks before Qt/Python garbage collection tears down children.
+        self.content_scroll.viewport().removeEventFilter(self)
         self.timer.stop()
         self.running = False
         self.pool.waitForDone(1000)

@@ -466,3 +466,131 @@ def test_edition_entry_uses_own_mode_and_does_not_switch(qapp, monkeypatch, edit
             assert not window.hook.connected and not window.running
     finally:
         window.close()
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_pause_discards_inflight_result_and_does_not_restart(qapp, monkeypatch, failed):
+    from mahjong_jev_advisor.state import Advice, Candidate
+    window = MainWindow()
+    state = _demo_reference_state()
+    window.last_state = state
+    window.pending_identity = state.identity()
+    window.running = True
+    window.advice_busy = True
+    window.stable_count = 2
+    started = []
+    monkeypatch.setattr(window, 'start_advice', started.append)
+    try:
+        window.toggle_recognition()
+        if failed:
+            window.on_advice_failure((state.identity(), 'late failure'))
+        else:
+            window.on_advice((state.identity(), Advice(Candidate('discard', '2s', 'old', 'old')), state))
+        assert not started and not window.running
+        assert window.pending_identity is None
+        assert window._current_chosen is None
+        assert not window.hero_card.rec_tile
+        assert '暂停' in window.hero_card.source_label.text()
+    finally:
+        window.close()
+
+
+def test_changed_capture_clears_old_advice_before_stabilizing(qapp, monkeypatch):
+    from dataclasses import replace
+    from mahjong_jev_advisor.vision import Observation
+    window = MainWindow()
+    window._load_initial_preview()
+    old = window.last_state
+    window.pending_identity = window.advised_identity = old.identity()
+    window.running = True
+    window.manual = False
+    latest = replace(old, honba=old.honba + 1)
+    started = []
+    monkeypatch.setattr(window, 'start_advice', started.append)
+    try:
+        frame = Observation(latest, 0.99, (), {})
+        window.on_observation(frame)
+        assert not started and window.stable_count == 1
+        assert window._current_chosen is None and not window.hero_card.rec_tile
+        window.on_observation(frame)
+        assert started == [latest]
+    finally:
+        window.close()
+
+
+def test_uncertain_capture_then_same_hand_requests_fresh_advice(qapp, monkeypatch):
+    from mahjong_jev_advisor.vision import Observation
+    window = MainWindow()
+    state = _demo_reference_state()
+    window.running = True
+    window.manual = False
+    window.pending_identity = window.advised_identity = state.identity()
+    started = []
+    monkeypatch.setattr(window, 'start_advice', started.append)
+    try:
+        window.on_observation(Observation(None, 0.1, ('uncertain',), {}))
+        window.on_observation(Observation(state, 0.99, (), {}))
+        window.on_observation(Observation(state, 0.99, (), {}))
+        assert started == [state]
+    finally:
+        window.close()
+
+
+def test_paused_hook_clears_old_candidate(qapp):
+    from dataclasses import replace
+    window = MainWindow()
+    window._load_initial_preview()
+    window.running = False
+    try:
+        window.on_hook_state(replace(window.last_state, honba=1))
+        assert window._current_chosen is None and not window.hero_card.rec_tile
+        assert window.pending_identity is None
+    finally:
+        window.close()
+
+
+def test_simulation_has_no_invented_probability(qapp):
+    window = MainWindow()
+    try:
+        window._load_initial_preview()
+        window.on_hand_tile_clicked('2s')
+        assert window.hero_card.bars_layout.count() == 0
+        assert window.hero_card.confidence_pill.text() == '未提供置信度'
+    finally:
+        window.close()
+
+
+def test_zero_ukeire_is_displayed_without_inventing_draw_status(qapp):
+    from mahjong_jev_advisor.state import Advice, Candidate
+    window = MainWindow()
+    state = _demo_reference_state()
+    window.pending_identity = state.identity()
+    chosen = Candidate('discard', state.hand[-1], 'discard', 'test', shanten=0, ukeire=0)
+    try:
+        window.on_advice((state.identity(), Advice(chosen), state))
+        assert window.hero_card.pill_draw_status.text() == '有效牌 0 张'
+    finally:
+        window.close()
+
+
+def test_closed_window_detaches_filter_and_reopening_restores_it(qapp):
+    from PySide6.QtCore import QEvent
+    class TrackedWindow(MainWindow):
+        events = 0
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.User:
+                self.events += 1
+            return super().eventFilter(watched, event)
+    window = TrackedWindow()
+    viewport = window.content_scroll.viewport()
+    try:
+        QApplication.sendEvent(viewport, QEvent(QEvent.Type.User))
+        assert window.events == 1
+        window.close()
+        QApplication.sendEvent(viewport, QEvent(QEvent.Type.User))
+        assert window.events == 1
+        window.show()
+        QApplication.sendEvent(viewport, QEvent(QEvent.Type.User))
+        assert window.events == 2
+    finally:
+        window.close()
