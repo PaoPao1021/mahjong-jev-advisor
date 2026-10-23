@@ -28,7 +28,7 @@ from .desktop_capture import GameWindow, WindowUnavailable, client_box, game_win
 from .jev import JevError, advise
 from .hook import HookBridge
 from .rules import (
-    NoDecision, UncertainState, candidates, danger, dora_value,
+    NoDecision, UncertainState, candidates, danger, dora_value, discard_comparison,
     shanten, shanten_text, ukeire_details, yaku_hints,
 )
 from .settings import Settings, append_decision_log, config_dir
@@ -39,7 +39,7 @@ from .ui_components import (
 )
 from .ui_dialogs import (
     JevSettingsDialog, LLMAnalysisDialog, LLMSettingsDialog, ManualStateDialog,
-    RegionDialog, TemplateDialog,
+    RegionDialog, TemplateDialog, DiscardComparisonDialog,
 )
 from .vision import (
     REGIONS, Observation, TemplateStore, VisionReader, detect_basic_regions,
@@ -416,6 +416,7 @@ class MainWindow(QMainWindow):
     def _on_ai_menu(self) -> None:
         menu = QMenu(self)
         menu.addAction("立即重新获取建议", self._force_recompute_advice)
+        menu.addAction("比较所有切法（本地）", self.show_discard_comparison)
         menu.addAction("大模型深度牌理解析 (LLM)", self.show_llm_analysis)
         menu.addAction("Jev 设置 (API Key)", self.edit_jev_settings)
         menu.addAction("大模型设置 (LLM)", self.edit_llm_settings)
@@ -1159,6 +1160,18 @@ class MainWindow(QMainWindow):
             self.settings.llm_model = dialog.model.text().strip()
             self.settings.save()
             self.bottom_bar.set_status_info("大模型设置已保存", f"模型：{self.settings.llm_model}")
+
+    def show_discard_comparison(self) -> None:
+        state = self.last_state
+        if state is None:
+            QMessageBox.information(self, "暂无局面", "请先识别牌桌或手动核对手牌。")
+            return
+        try:
+            options = discard_comparison(state)
+        except (ValueError, NoDecision, UncertainState) as error:
+            QMessageBox.information(self, "暂时无法比较", str(error))
+            return
+        DiscardComparisonDialog(state, options, self).exec()
 
     def show_llm_analysis(self) -> None:
         """Launches LLM deep tactical analysis dialog."""

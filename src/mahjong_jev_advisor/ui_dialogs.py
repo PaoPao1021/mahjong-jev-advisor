@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QScrollArea, QSpinBox, QDoubleSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QApplication,
 )
 
 from .settings import Settings
@@ -64,6 +65,67 @@ def make_dialog_header(title: str, subtitle: str, badge_text: str | None = None)
         lbl_sub.setWordWrap(True)
         layout.addWidget(lbl_sub)
     return banner
+
+
+class DiscardComparisonDialog(QDialog):
+    """Read-only local comparison of the immutable state captured when opened."""
+
+    def __init__(self, state: GameState, options: tuple[Candidate, ...], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("切牌比较 · 当前局面快照")
+        layout = QVBoxLayout(self)
+        layout.addWidget(make_dialog_header("切牌比较", "点击列标题排序；数值由本地规则计算，不是模型概率。", "本地分析"))
+        snapshot = QLabel(f"{state.player_count}人麻将 · 手牌：{' '.join(state.hand)}")
+        snapshot.setWordWrap(True)
+        layout.addWidget(snapshot)
+        note = QLabel("此表保留打开时的局面，牌局变化后请关闭并重新打开。危险级为相对指标；立直后或副露后的操作限制仍需在游戏中确认。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.table = QTableWidget(len(options), 6)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet("""
+            QTableWidget { background: #0f172a; alternate-background-color: #172238;
+                color: #e2e8f0; gridline-color: #334155; border: 1px solid #334155;
+                selection-background-color: #164e63; selection-color: #ffffff; }
+            QHeaderView::section { background: #1e293b; color: #cbd5e1;
+                padding: 7px; border: none; border-right: 1px solid #334155; }
+        """)
+        self.headers = ["切牌", "向听", "进张（张）", "危险级", "弃宝牌", "有效牌"]
+        self.table.setHorizontalHeaderLabels(self.headers)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().hide()
+        for row, candidate in enumerate(options):
+            values = [candidate.tile, candidate.shanten, candidate.ukeire, candidate.danger,
+                      candidate.dora_loss, " ".join(candidate.improving_tiles) or "—"]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, value if value is not None else "—")
+                item.setToolTip(candidate.rationale)
+                self.table.setItem(row, column, item)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        # Keep the rule engine's initial order until the user chooses a column.
+        self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.table.setSortingEnabled(True)
+        layout.addWidget(self.table)
+        layout.addWidget(QLabel("0 向听表示听牌；进张张数按已知可见牌估算，不代表实际牌墙。"))
+        buttons = QHBoxLayout()
+        copy_button = QPushButton("复制比较表")
+        copy_button.clicked.connect(self.copy_table)
+        buttons.addWidget(copy_button)
+        buttons.addStretch()
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        self.resize(760, 500)
+
+    def copy_table(self) -> None:
+        rows = ["\t".join(self.headers)]
+        for row in range(self.table.rowCount()):
+            rows.append("\t".join(self.table.item(row, col).text() for col in range(self.table.columnCount())))
+        QApplication.clipboard().setText("\n".join(rows))
 
 
 class SelectionCanvas(QWidget):

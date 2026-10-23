@@ -588,3 +588,38 @@ def test_ctrl_wheel_changes_opacity_and_regular_wheel_does_not(qapp):
             assert window.settings.opacity == pytest.approx(expected)
     finally:
         window.close()
+
+
+def test_comparison_table_numeric_sort_and_copy(qapp):
+    from mahjong_jev_advisor.rules import discard_comparison
+    from mahjong_jev_advisor.ui_dialogs import DiscardComparisonDialog
+    state = _demo_reference_state()
+    rows = discard_comparison(state)
+    dialog = DiscardComparisonDialog(state, rows)
+    try:
+        assert dialog.table.rowCount() == len(set(state.hand))
+        assert [dialog.table.item(i, 0).text() for i in range(len(rows))] == [c.tile for c in rows]
+        dialog.table.sortItems(2, Qt.SortOrder.AscendingOrder)
+        counts = [int(dialog.table.item(i, 2).text()) for i in range(len(rows))]
+        assert counts == sorted(c.ukeire for c in rows)
+        dialog.copy_table()
+        text = QApplication.clipboard().text()
+        assert len(text.splitlines()) == len(rows) + 1
+        assert '进张（张）' in text and '危险级' in text
+        assert text.splitlines()[1].split('\t')[0] == dialog.table.item(0, 0).text()
+    finally:
+        dialog.close()
+
+
+def test_comparison_unavailable_hand_shows_notice_without_dialog(qapp, monkeypatch):
+    from mahjong_jev_advisor import app as module
+    from mahjong_jev_advisor.state import GameState
+    window = MainWindow()
+    notices = []
+    monkeypatch.setattr(module.QMessageBox, 'information', lambda *args: notices.append(args))
+    window.last_state = GameState.from_dict({'hand': '123m456p789s123z5m'})
+    try:
+        window.show_discard_comparison()
+        assert notices and '暂时无法比较' in notices[0]
+    finally:
+        window.close()
