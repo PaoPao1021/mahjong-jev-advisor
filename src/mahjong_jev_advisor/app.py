@@ -47,6 +47,17 @@ from .vision import (
 )
 
 
+class AdvisorScrollArea(QScrollArea):
+    """Forward only Ctrl-wheel input, never general Qt teardown events."""
+    opacity_wheel = Signal(object)
+
+    def wheelEvent(self, event: Any) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.opacity_wheel.emit(event)
+        else:
+            super().wheelEvent(event)
+
+
 def overlay_size_for_screen(available: QRect) -> tuple[int, int]:
     """Return a usable logical-pixel HUD size for the current screen."""
     return min(390, max(320, available.width() - 24)), min(720, max(320, available.height() - 64))
@@ -218,12 +229,12 @@ class MainWindow(QMainWindow):
 
         # Keep controls visible while dense table and decision details scroll on
         # shorter screens (including 720p and scaled laptop displays).
-        self.content_scroll = QScrollArea(self)
+        self.content_scroll = AdvisorScrollArea(self)
         self.content_scroll.setObjectName("hudContentScroll")
         self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.content_scroll.setWidgetResizable(True)
         self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.content_scroll.viewport().installEventFilter(self)
+        self.content_scroll.opacity_wheel.connect(self.wheelEvent)
         content = QWidget()
         content.setObjectName("hudScrollableContent")
         content_layout = QVBoxLayout(content)
@@ -319,17 +330,6 @@ class MainWindow(QMainWindow):
         else:
             super().wheelEvent(event)
 
-    def eventFilter(self, watched: Any, event: Any) -> bool:
-        if (
-            # Qt can deliver teardown events after the scroll area is deleted.
-            event.type() == QEvent.Type.Wheel
-            and watched is self.content_scroll.viewport()
-            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        ):
-            self.wheelEvent(event)
-            return True
-        return super().eventFilter(watched, event)
-
     def _load_initial_preview(self) -> None:
         """Loads a demo state resembling the reference image so UI looks spectacular out-of-the-box."""
         self._demo_preview = True
@@ -386,7 +386,6 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event: Any) -> None:
         super().showEvent(event)
-        self.content_scroll.viewport().installEventFilter(self)
         if not self._screen_bound and self.windowHandle() is not None:
             self.windowHandle().screenChanged.connect(self._on_screen_changed)
             self._screen_bound = True
@@ -1275,8 +1274,6 @@ class MainWindow(QMainWindow):
             self._begin_realtime(f"已学习 {learned} 个当前牌面样本 · 后续变化自动识别")
 
     def closeEvent(self, event: Any) -> None:
-        # Detach Python callbacks before Qt/Python garbage collection tears down children.
-        self.content_scroll.viewport().removeEventFilter(self)
         self.timer.stop()
         self.running = False
         self.pool.waitForDone(1000)

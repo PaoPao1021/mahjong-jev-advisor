@@ -573,24 +573,18 @@ def test_zero_ukeire_is_displayed_without_inventing_draw_status(qapp):
         window.close()
 
 
-def test_closed_window_detaches_filter_and_reopening_restores_it(qapp):
-    from PySide6.QtCore import QEvent
-    class TrackedWindow(MainWindow):
-        events = 0
-        def eventFilter(self, watched, event):
-            if event.type() == QEvent.Type.User:
-                self.events += 1
-            return super().eventFilter(watched, event)
-    window = TrackedWindow()
-    viewport = window.content_scroll.viewport()
+def test_ctrl_wheel_changes_opacity_and_regular_wheel_does_not(qapp):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QWheelEvent
+    window = MainWindow()
     try:
-        QApplication.sendEvent(viewport, QEvent(QEvent.Type.User))
-        assert window.events == 1
-        window.close()
-        QApplication.sendEvent(viewport, QEvent(QEvent.Type.User))
-        assert window.events == 1
         window.show()
-        QApplication.sendEvent(viewport, QEvent(QEvent.Type.User))
-        assert window.events == 2
+        window.set_opacity(0.8)
+        for modifiers, expected in [(Qt.KeyboardModifier.NoModifier, 0.8),
+                                    (Qt.KeyboardModifier.ControlModifier, 0.85)]:
+            event = QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, 120),
+                                Qt.MouseButton.NoButton, modifiers, Qt.ScrollPhase.NoScrollPhase, False)
+            QApplication.sendEvent(window.content_scroll.viewport(), event)
+            assert window.settings.opacity == pytest.approx(expected)
     finally:
         window.close()
