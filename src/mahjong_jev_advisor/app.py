@@ -17,7 +17,7 @@ import cv2
 import mss
 import numpy as np
 from PySide6.QtCore import QEvent, QPoint, QRect, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontDatabase, QIcon
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontDatabase, QIcon, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QLayout, QMainWindow, QMenu, QMessageBox,
     QScrollArea, QVBoxLayout, QWidget, QInputDialog,
@@ -56,6 +56,29 @@ class AdvisorScrollArea(QScrollArea):
             self.opacity_wheel.emit(event)
         else:
             super().wheelEvent(event)
+
+
+def fit_window_geometry(saved: QRect, available: QRect) -> QRect:
+    """Keep the client rectangle inside a usable screen, reserving caption space."""
+    bounds = available.adjusted(8, 32, -8, -8)
+    width = min(max(320, saved.width()), bounds.width())
+    height = min(max(320, saved.height()), bounds.height())
+    return QRect(max(bounds.left(), min(saved.x(), bounds.right() - width + 1)),
+                 max(bounds.top(), min(saved.y(), bounds.bottom() - height + 1)), width, height)
+
+
+def capture_window_rect(window: QWidget) -> QRect:
+    """Match capture coordinates, including native Windows DPI and window chrome."""
+    if sys.platform == "win32":
+        from ctypes.wintypes import RECT
+        native_rect = RECT()
+        get_rect = ctypes.windll.user32.GetWindowRect
+        get_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+        get_rect.restype = ctypes.c_int
+        if get_rect(int(window.winId()), ctypes.byref(native_rect)):
+            return QRect(native_rect.left, native_rect.top,
+                         native_rect.right - native_rect.left, native_rect.bottom - native_rect.top)
+    return window.frameGeometry()
 
 
 def overlay_size_for_screen(available: QRect) -> tuple[int, int]:
@@ -177,6 +200,9 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
 
         self.settings = Settings.load()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.settings.always_on_top)
+        self._comparison_dialog = None
+        self._comparison_state_available = False
         edition = launch_edition()
         if edition:
             # Recover settings imported from the other edition without mixing calibration.
@@ -274,12 +300,19 @@ class MainWindow(QMainWindow):
         self.bottom_bar.llm_settings_clicked.connect(self.edit_llm_settings)
         self.bottom_bar.toggle_clicked.connect(self.toggle_recognition)
         self.bottom_bar.manual_clicked.connect(self.manual_state)
+        self.bottom_bar.compare_clicked.connect(self.show_discard_comparison)
         root_layout.addWidget(self.bottom_bar)
+        self.compare_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self.compare_shortcut.activated.connect(self.show_discard_comparison)
 
         self.setMinimumSize(320, 320)
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen is not None:
             self._adapt_to_screen(screen)
+            if self.settings.window_geometry:
+                saved = QRect(*self.settings.window_geometry)
+                target = QApplication.screenAt(saved.center()) or screen
+                self.setGeometry(fit_window_geometry(saved, target.availableGeometry()))
         else:
             self.resize(390, 720)
         self.setWindowOpacity(self.settings.opacity)
@@ -449,6 +482,11 @@ class MainWindow(QMainWindow):
         menu.addAction("标注牌面样本", self.label_templates)
         menu.addAction("保存当前帧截图", self.save_frame)
         menu.addSeparator()
+        pin = menu.addAction("窗口置顶")
+        pin.setCheckable(True)
+        pin.setChecked(self.settings.always_on_top)
+        pin.triggered.connect(self.set_always_on_top)
+        menu.addAction("恢复窗口大小与位置", self.reset_window_layout)
         op_menu = menu.addMenu("窗口透明度")
         for val, title in [
             (1.0, "100% 完全不透明"),
@@ -459,6 +497,31 @@ class MainWindow(QMainWindow):
         ]:
             op_menu.addAction(title, lambda v=val: self._select_opacity(v))
         menu.exec(self.title_bar.btn_table.mapToGlobal(QPoint(0, self.title_bar.btn_table.height() + 2)))
+
+    def set_always_on_top(self, enabled: bool) -> None:
+        self.settings.always_on_top = enabled
+        self.settings.save()
+        geometry = self.geometry()
+        visible = self.isVisible()
+        state = self.windowState()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        self._capture_excluded = False
+        self.setGeometry(geometry)
+        self.setWindowState(state)
+        if visible:
+            self.show()
+        self.bottom_bar.set_status_info("窗口已置顶" if enabled else "已取消置顶", "可在【桌】菜单切换")
+
+    def reset_window_layout(self) -> None:
+        screen = QApplication.screenAt(QCursor.pos()) or self.screen()
+        self.showNormal()
+        self._adapt_to_screen(screen)
+        available = screen.availableGeometry()
+        self.setGeometry(fit_window_geometry(QRect(available.left() + 24, available.top() + 48,
+                                                   self.width(), self.height()), available))
+        self.settings.window_geometry = self.geometry().getRect()
+        self.settings.save()
+        self.bottom_bar.set_status_info("窗口已恢复", "已移回当前屏幕，位置与大小会在关闭时保存")
 
     def set_input_source(self, source: str) -> None:
         if launch_edition() and source != launch_edition():
@@ -577,6 +640,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "网页 Hook 诊断", detail)
 
     def _render_state(self, state: GameState, highlight_tile: str | None = None) -> None:
+        self._comparison_state_available = True
+        if self._comparison_dialog is not None:
+            self._comparison_dialog.mark_current_state(state)
         # Hand & drawn tile
         self.hand_widget.set_hand(state.hand, highlight_tile=highlight_tile)
 
@@ -973,17 +1039,12 @@ class MainWindow(QMainWindow):
             return
         if not self._update_steam_window():
             return
-        capture_rect = self.geometry()
-        if sys.platform == "win32":
-            from ctypes.wintypes import RECT
-            native_rect = RECT()
-            get_rect = ctypes.windll.user32.GetWindowRect
-            get_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
-            get_rect.restype = ctypes.c_int
-            if get_rect(int(self.winId()), ctypes.byref(native_rect)):
-                capture_rect = QRect(native_rect.left, native_rect.top,
-                    native_rect.right - native_rect.left, native_rect.bottom - native_rect.top)
-        if not self._capture_excluded and capture_rect.intersects(QRect(*self.settings.game_box)):
+        game_rect = QRect(*self.settings.game_box)
+        comparison = self._comparison_dialog
+        if comparison is not None and comparison.isVisible() and capture_window_rect(comparison).intersects(game_rect):
+            self.on_capture_failure("切牌比较窗口遮挡了牌桌，请移开或关闭后继续识别")
+            return
+        if not self._capture_excluded and capture_window_rect(self).intersects(game_rect):
             self.on_capture_failure("顾问窗口遮挡了牌桌，无法取得当前画面")
             self.bottom_bar.set_status_info("窗口遮挡牌桌", "系统不支持排除悬浮窗，请把顾问窗口移到牌桌区域外")
             return
@@ -1002,6 +1063,9 @@ class MainWindow(QMainWindow):
             self.show()
 
     def on_capture_failure(self, error: str) -> None:
+        self._comparison_state_available = False
+        if self._comparison_dialog is not None:
+            self._comparison_dialog.mark_current_state(None)
         self._show_after_capture()
         self.capture_busy = False
         self.pending_identity = None
@@ -1027,6 +1091,9 @@ class MainWindow(QMainWindow):
                 self.hand_widget.set_hand(observation.debug["recognized_hand"])
 
         if observation.problems or observation.state is None or observation.confidence < 0.90:
+            self._comparison_state_available = False
+            if self._comparison_dialog is not None:
+                self._comparison_dialog.mark_current_state(None)
             self.pending_identity = None
             self.advised_identity = None
             self.stable_count = 0
@@ -1171,7 +1238,24 @@ class MainWindow(QMainWindow):
         except (ValueError, NoDecision, UncertainState) as error:
             QMessageBox.information(self, "暂时无法比较", str(error))
             return
-        DiscardComparisonDialog(state, options, self).exec()
+        if self._comparison_dialog is None:
+            dialog = DiscardComparisonDialog(state, options, self)
+            self._comparison_dialog = dialog
+            dialog.refresh_requested.connect(self.show_discard_comparison)
+            dialog.finished.connect(self._close_comparison)
+        else:
+            self._comparison_dialog.set_snapshot(state, options)
+        if not self._comparison_state_available:
+            self._comparison_dialog.mark_current_state(None)
+        self._comparison_dialog.show()
+        self._comparison_dialog.raise_()
+        self._comparison_dialog.activateWindow()
+
+    def _close_comparison(self, result: int) -> None:
+        dialog = self._comparison_dialog
+        self._comparison_dialog = None
+        if dialog is not None:
+            dialog.deleteLater()
 
     def show_llm_analysis(self) -> None:
         """Launches LLM deep tactical analysis dialog."""
@@ -1287,6 +1371,15 @@ class MainWindow(QMainWindow):
             self._begin_realtime(f"已学习 {learned} 个当前牌面样本 · 后续变化自动识别")
 
     def closeEvent(self, event: Any) -> None:
+        if self._comparison_dialog is not None:
+            self._comparison_dialog.close()
+        rectangle = self.normalGeometry() if self.isMaximized() or self.isMinimized() else self.geometry()
+        if rectangle.isValid():
+            self.settings.window_geometry = rectangle.getRect()
+            try:
+                self.settings.save()
+            except OSError:
+                pass  # Closing must still work if the configuration directory is read-only.
         self.timer.stop()
         self.running = False
         self.pool.waitForDone(1000)
@@ -1766,6 +1859,10 @@ QDialog QScrollArea {
     background: transparent;
     border: 1px solid rgba(51, 65, 85, 0.5);
     border-radius: 6px;
+}
+QPushButton:focus, QPushButton#hudGhostBtn:focus, QPushButton#hudPrimaryBtn:focus,
+QPushButton#headerPillBtn:focus {
+    border: 1px solid #38bdf8;
 }
 """
 

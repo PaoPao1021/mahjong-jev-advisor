@@ -733,6 +733,7 @@ class BottomActionBar(QWidget):
 
     ai_suggest_clicked = Signal()
     llm_analysis_clicked = Signal()
+    compare_clicked = Signal()
     clear_clicked = Signal()
     jev_settings_clicked = Signal()
     llm_settings_clicked = Signal()
@@ -758,40 +759,52 @@ class BottomActionBar(QWidget):
 
         self.status_summary = QLabel("等待牌局与模型连接")
         self.status_summary.setObjectName("bottomStatusSub")
+        self.status_summary.setWordWrap(True)
+        self.status_title.setWordWrap(True)
         box_layout.addWidget(self.status_summary)
 
         layout.addWidget(self.status_box)
 
         # Main button bar: [AI建议] [深度解析] [清空] [Jev设置] [大模型设置]
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(3)
+        btn_row = QGridLayout()
+        btn_row.setSpacing(5)
 
         self.btn_ai = QPushButton("AI建议")
         self.btn_ai.setObjectName("hudGhostBtn")
         self.btn_ai.clicked.connect(self.ai_suggest_clicked.emit)
-        btn_row.addWidget(self.btn_ai)
+        btn_row.addWidget(self.btn_ai, 0, 0)
 
         self.btn_explain = QPushButton("深度解析")
         self.btn_explain.setObjectName("hudGhostBtn")
         self.btn_explain.setToolTip("使用大模型 (LLM) 进行深度战术与牌理解析")
         self.btn_explain.clicked.connect(self.llm_analysis_clicked.emit)
-        btn_row.addWidget(self.btn_explain)
+        btn_row.addWidget(self.btn_explain, 0, 2)
 
         self.btn_clear = QPushButton("清空")
         self.btn_clear.setObjectName("hudGhostBtn")
         self.btn_clear.clicked.connect(self.clear_clicked.emit)
-        btn_row.addWidget(self.btn_clear)
+        btn_row.addWidget(self.btn_clear, 1, 2)
 
         self.btn_jev = QPushButton("Jev设置")
         self.btn_jev.setObjectName("hudGhostBtn")
         self.btn_jev.clicked.connect(self.jev_settings_clicked.emit)
-        btn_row.addWidget(self.btn_jev)
+        btn_row.addWidget(self.btn_jev, 1, 0)
 
         self.btn_llm = QPushButton("大模型设置")
         self.btn_llm.setObjectName("hudGhostBtn")
         self.btn_llm.clicked.connect(self.llm_settings_clicked.emit)
-        btn_row.addWidget(self.btn_llm)
+        btn_row.addWidget(self.btn_llm, 1, 1)
 
+        self.btn_compare = QPushButton("切牌比较")
+        self.btn_compare.setObjectName("hudGhostBtn")
+        self.btn_compare.setToolTip("比较所有切法，无需 API Key（Ctrl+K）")
+        self.btn_compare.clicked.connect(self.compare_clicked.emit)
+        btn_row.addWidget(self.btn_compare, 0, 1)
+        for column in range(3):
+            btn_row.setColumnStretch(column, 1)
+        for button in (self.btn_ai, self.btn_compare, self.btn_explain, self.btn_jev, self.btn_llm, self.btn_clear):
+            button.setMinimumHeight(30)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
         layout.addLayout(btn_row)
 
         # Secondary row: [开始识别] [手动核对]
@@ -809,6 +822,10 @@ class BottomActionBar(QWidget):
         sec_row.addWidget(self.btn_manual, 2)
 
         layout.addLayout(sec_row)
+        navigation = (self.btn_ai, self.btn_compare, self.btn_explain, self.btn_jev,
+                      self.btn_llm, self.btn_clear, self.btn_toggle, self.btn_manual)
+        for current, following in zip(navigation, navigation[1:]):
+            QWidget.setTabOrder(current, following)
 
     def set_status_info(self, title: str, summary: str) -> None:
         self.status_title.setText(title)

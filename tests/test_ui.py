@@ -623,3 +623,112 @@ def test_comparison_unavailable_hand_shows_notice_without_dialog(qapp, monkeypat
         assert notices and '暂时无法比较' in notices[0]
     finally:
         window.close()
+
+
+@pytest.mark.parametrize('available,saved', [
+    (QRect(0, 0, 1280, 720), QRect(3000, 2000, 450, 640)),
+    (QRect(-1920, 0, 1920, 1080), QRect(-1800, 80, 450, 640)),
+    (QRect(0, 0, 800, 600), QRect(-200, -100, 1600, 1200)),
+])
+def test_saved_window_fits_available_screen(available, saved):
+    from mahjong_jev_advisor.app import fit_window_geometry
+    fitted = fit_window_geometry(saved, available)
+    assert available.adjusted(8, 32, -8, -8).contains(fitted)
+    if available.adjusted(8, 32, -8, -8).contains(saved):
+        assert fitted == saved
+
+
+def test_window_preferences_survive_restart(qapp):
+    from mahjong_jev_advisor.settings import Settings
+    from mahjong_jev_advisor.app import fit_window_geometry
+    window = MainWindow()
+    window.show()
+    qapp.processEvents()
+    desired = fit_window_geometry(QRect(70, 90, 410, 510), window.screen().availableGeometry())
+    window.setGeometry(desired)
+    window.set_always_on_top(False)
+    qapp.processEvents()
+    saved = window.geometry()
+    window.close()
+    assert Settings.load().window_geometry == saved.getRect()
+    restored = MainWindow()
+    try:
+        assert not restored.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+        assert restored.geometry() == saved
+    finally:
+        restored.close()
+
+
+def test_comparison_reuses_window_refreshes_and_marks_stale(qapp):
+    from mahjong_jev_advisor.state import GameState
+    window = MainWindow()
+    window._load_initial_preview()
+    try:
+        window.show_discard_comparison()
+        dialog = window._comparison_dialog
+        assert dialog.isVisible() and not dialog.isModal()
+        window.show_discard_comparison()
+        assert window._comparison_dialog is dialog
+        original = dialog.snapshot_identity
+        changed = GameState.from_dict({'hand': '123m456p789s123z55m'})
+        window.last_state = changed
+        window._render_state(changed)
+        assert '牌面已变化' in dialog.freshness_label.text()
+        assert dialog.snapshot_identity == original
+        QTest.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+        assert dialog.snapshot_identity == changed.identity()
+        assert '当前局面快照' in dialog.freshness_label.text()
+        dialog.table.selectRow(1)
+        assert dialog.detail_label.text() == dialog.table.item(1, 0).data(Qt.ItemDataRole.UserRole)
+        QTest.mouseClick(dialog.copy_button, Qt.MouseButton.LeftButton)
+        assert '已复制' in dialog.feedback_label.text()
+        window.on_capture_failure('采集失败')
+        QTest.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+        assert '当前画面不可用' in dialog.freshness_label.text()
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+        assert window._comparison_dialog is None
+    finally:
+        window.close()
+
+
+def test_comparison_overlap_blocks_capture_until_moved(qapp, monkeypatch):
+    from mahjong_jev_advisor import app as module
+    window = MainWindow()
+    window._load_initial_preview()
+    window.show_discard_comparison()
+    comparison = window._comparison_dialog
+    window.running, window.manual = True, False
+    window._capture_excluded = True
+    window.settings.game_box = (0, 0, 800, 600)
+    monkeypatch.setattr(window, '_update_steam_window', lambda: True)
+    rect = [QRect(100, 100, 400, 400)]
+    monkeypatch.setattr(module, 'capture_window_rect', lambda _: rect[0])
+    started = []
+    monkeypatch.setattr(window.pool, 'start', started.append)
+    try:
+        window.capture_tick()
+        assert not started
+        assert '切牌比较窗口遮挡' in window.bottom_bar.status_summary.text()
+        assert '不可用' in comparison.freshness_label.text()
+        rect[0] = QRect(900, 0, 400, 400)
+        window.capture_tick()
+        assert len(started) == 1
+    finally:
+        window.close()
+
+
+def test_compact_action_bar_tab_order_and_bounds(qapp):
+    bar = BottomActionBar()
+    bar.resize(320, bar.sizeHint().height())
+    bar.show()
+    qapp.processEvents()
+    buttons = (bar.btn_ai, bar.btn_compare, bar.btn_explain, bar.btn_jev,
+               bar.btn_llm, bar.btn_clear, bar.btn_toggle, bar.btn_manual)
+    try:
+        for index, button in enumerate(buttons):
+            assert bar.rect().contains(button.geometry())
+            assert button.width() >= button.minimumSizeHint().width()
+            if index + 1 < len(buttons):
+                assert button.nextInFocusChain() is buttons[index + 1]
+    finally:
+        bar.close()
