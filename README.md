@@ -70,18 +70,41 @@
 
 推荐流程：**获取启动包或源码 → 启动顾问 → 测试模型连接 → 安装浏览器扩展 → 进入牌局。**
 
-### 免 Python 启动包
+### 两个版本，分别下载
 
-发布包由 [Portable release builds](https://github.com/PaoPao1021/mahjong-jev-advisor/actions/workflows/release.yml) 工作流构建。正式发布后的 ZIP 可从 [Releases](https://github.com/PaoPao1021/mahjong-jev-advisor/releases) 下载；若尚无正式版本，可在已成功的手动构建记录中下载 `portable-*` 候选包（GitHub Actions 下载需登录）。Actions 下载得到的外层压缩包中包含应用 ZIP 和 SHA256 文件，请继续解压应用 ZIP。
+项目提供 **网页版** 和 **Steam 版（实验性）** 两个独立入口，使用同一套牌理与模型引擎；各有安装包、配置目录与使用指南。**原版 v0.1.0 发布包继续保留**，无需覆盖或卸载。请把每个 ZIP 解压到不同文件夹。
 
-| 文件名后缀 | 适用设备 | 启动方式 |
+| 选择 | 网页版 | Steam 版（实验性） |
 | --- | --- | --- |
-| `windows-x64.zip` | 64 位 Windows Intel / AMD | 解压完整文件夹，双击 `MahjongJevAdvisor.exe` |
-| `macos-arm64.zip` | Apple Silicon Mac | 解压后双击 `MahjongJevAdvisor.app` |
+| 使用场景 | Chrome / Edge 中运行雀魂 | Steam 雀魂客户端 |
+| 采集方式 | 浏览器扩展 Hook，四人 / 三人自动识别 | 四人截图 + 校准 / 模板；三人手动录入 |
+| Windows 启动 | `MahjongJevAdvisor-Web.exe` | `MahjongJevAdvisor-Steam.exe` |
+| macOS 启动 | `MahjongJevAdvisor-Web.app` | `MahjongJevAdvisor-Steam.app` |
+| 前置操作 | 加载扩展，再刷新游戏 | 绑定或框选窗口，校准并核对手牌 |
+| 配置 | 沿用原版目录 | 独立 `mahjong-jev-advisor-steam` 目录，Key 单独填写 |
+| 完整指南 | [网页版安装与使用](docs/browser.md) | [Steam 版分系统使用方案](docs/steam.md) |
 
-包内含 Python、Qt、OCR 模型、`browser-extension` 和 `QUICKSTART.txt`。**不需要安装 Python 或 pip**，但仍需自行配置 API Key 并安装浏览器扩展。保留应用旁边的扩展文件夹，不要只移动 EXE / APP。Intel Mac 暂用下方源码方式启动。
+前往 [Releases](https://github.com/PaoPao1021/mahjong-jev-advisor/releases) 按以下后缀选择。双版本从 **v0.2.0** 开始提供；v0.1.0 只有原版入口。Steam 功能仍处于实验阶段，新发布的双版本包会先标记为预发布。
 
-候选包未进行商业证书签名或 Apple 公证，系统可能提示来源未知；具体启动说明见包内 `QUICKSTART.txt`。下载后可用同名 `.zip.sha256` 文件校验。便携包验证包括实际启动冻结后的程序、加载 OCR 模型、三麻/四麻候选计算及 Qt 渲染，不代表所有目标设备均已完成手动验收。
+| 文件后缀 | 设备 |
+| --- | --- |
+| `browser-windows-x64.zip` | 网页版 · 64 位 Windows Intel / AMD |
+| `browser-macos-arm64.zip` | 网页版 · Apple Silicon Mac |
+| `steam-windows-x64.zip` | Steam 版 · 64 位 Windows Intel / AMD |
+| `steam-macos-arm64.zip` | Steam 版 · Apple Silicon Mac |
+
+完整解压后启动。两版均内含 Python、Qt、OCR 模型、`QUICKSTART.txt` 和专属 `USAGE.md`，不需要安装 Python 或 pip。**只有网页版附带并需要安装浏览器扩展**，保留应用旁边的 `browser-extension` 文件夹。Intel Mac 暂用源码启动。
+
+启动包未商业签名或 Apple 公证，系统可能提示来源未知；处理方式见包内指南。可用对应 `.zip.sha256` 文件校验下载。打包验证包括运行冻结应用、检查版本入口、加载 OCR、三麻 / 四麻候选和 Qt 渲染；不代表真实 Steam 对局已经验收。
+
+### 源码选择入口
+
+| 系统 | 网页版 | Steam 版 |
+| --- | --- | --- |
+| Windows | 双击 `run_browser_windows.cmd` | 双击 `run_steam_windows.cmd` |
+| macOS | 双击 `run_browser_macos.command` | 双击 `run_steam_macos.command` |
+
+macOS 也可在项目目录运行 `zsh run_browser_macos.command` 或 `zsh run_steam_macos.command`。四个入口设置各自默认模式和配置目录；首次使用仍需 Python 3.12。原 `run_windows.cmd` / `run_macos.sh` 保留为通用开发入口，使用原配置目录，可在【桌】切换输入来源。
 
 以下为源码启动方式：
 
@@ -162,6 +185,7 @@ zsh run_macos.sh
 | --- | --- |
 | 【开始识别】/【暂停识别】 | 开启或暂停自动建议流程 |
 | 【AI建议】 | 对已取得的当前局面重新请求建议 |
+| 【切牌比较】或 Ctrl + K | 并排查看所有不同切牌的向听、进张、危险级、弃宝牌与有效牌；支持排序、刷新、复制，无需 API Key；【AI】菜单也可打开 |
 | 【深度解析】 | 使用聊天模型解释当前选中的建议，需先配置【大模型设置】 |
 | 【手动核对】 | 修正或录入手牌、玩法、宝牌指示牌、按钮与局况 |
 | 【清空】 | 清除当前展示的状态与建议 |
@@ -169,6 +193,10 @@ zsh run_macos.sh
 | 【桌】→【查看网页 Hook 诊断】 | 查看扩展版本、帧计数、状态重建次数和解码错误 |
 | 【AI】→【载入示范对局状态】 | 查看界面示例；示范状态不能作为真实牌局发送建议请求 |
 | 【桌】→【窗口透明度】 | 调整窗口透明度，也支持 Ctrl + 滚轮 |
+| 【桌】→【窗口置顶】 | 切换窗口是否始终显示在其他窗口上方，下次启动保留偏好 |
+| 【桌】→【恢复窗口大小与位置】 | 将窗口移回鼠标所在屏幕并恢复适合该屏幕的大小；关闭时自动保存窗口位置与大小 |
+
+底部操作区分为两行，缩窄窗口时仍可使用全部按钮；Tab 按可见顺序移动焦点。启动时会把保存的窗口位置限制在可用屏幕内，避免移除外接显示器后找不到窗口。
 
 ### 怎样阅读建议
 
@@ -176,6 +204,9 @@ zsh run_macos.sh
 - **有效牌 / 进张**根据当前手牌与已知可见牌估算，不知道对手暗手和未来牌墙。
 - **选择概率、置信度**仅在在线服务返回相应数据时展示。选择概率不是和牌率，也不是收益保证；本地规则评分会使用不同标注。
 - **危险级、防守倾向**是启发式指标，不是经过校准的放铳概率。
+- **手动模拟**可点击手牌比较切牌后的向听数、进张与相对危险级；不会显示虚构的模型概率或置信度。
+- **切牌比较表**使用独立窗口，可同时操作主窗口。选择一行查看完整牌理，牌局变化时会提示快照过期，点击【刷新局面】或 Ctrl + R 更新；Esc 关闭。需要摸牌后的完整手牌，红五与普通五分别列出。截图模式下，比较窗口遮挡牌桌会暂停采集，移开或关闭后恢复；画面不可用时仍可查看旧快照，但不会标为当前局面。该表不会改变在线模型的候选列表，也不替你执行操作。
+- **建议随局面失效。** 截图变化时立即撤下旧建议，连续两次识别一致后重新计算；暂停识别后，未完成请求的结果不会重新显示。
 - **役种、番数与点数**属于当前实现的估算。三人局暂不显示四麻计分库计算的点数总额。
 
 ### 三人麻将
@@ -229,12 +260,12 @@ zsh run_macos.sh
 
 ### Steam 客户端（实验性）
 
-**此功能已加入当前源码，v0.1.0 发布包不包含。** 按上方源码方式更新并启动；下载旧发布包不会出现 Steam 菜单。[Steam 雀魂商店页](https://store.steampowered.com/app/1329410/MahjongSoul/)。
+**Steam 版从 v0.2.0 双版本包提供，v0.1.0 不包含。** 详细步骤见 [Steam 版使用指南](docs/steam.md)；也可使用独立的源码 Steam 入口。[Steam 雀魂商店页](https://store.steampowered.com/app/1329410/MahjongSoul/)。
 
 Steam 模式通过屏幕截图、牌面模板与 OCR 获取信息，再使用同一套候选生成和 Jev 建议引擎。它不需要浏览器扩展。当前支持 **四人布局的实验性连续识别，以及三人 / 四人的手动输入**；尚未完成真实 Steam 对局验收，不能保证开箱即用或达到网页版 Hook 的准确度。上方两张演示均来自网页版。
 
 1. 启动 Steam 雀魂，进入牌局并保持**窗口化、可见且无遮挡**。先完成顾问的【Jev设置】和连接测试。
-2. 在顾问点击 **【桌】→【输入来源】→【Steam 客户端（截图）】**。切换后停止原来的识别并清除旧建议；后台网页事件不会写入 Steam 局面。
+2. 启动独立的 Steam 版后已默认进入截图模式；若使用原通用开发入口，点击 **【桌】→【输入来源】→【Steam 客户端（截图）】**。后台网页事件不会写入 Steam 局面。
 3. **Windows：** 点击【桌】→【绑定 Steam 雀魂窗口（Windows）】，选择游戏窗口。程序只取客户区，移动窗口后自动更新采集位置。找不到窗口时，使用【选择牌桌画面】手动框选。
 4. **macOS：** 使用【桌】→【选择牌桌画面】，只框选完整游戏画面；为运行顾问的应用或终端开启系统屏幕录制权限。手动框选后移动窗口，需要重新框选。
 5. 点击【开始识别】尝试自动定位，按提示核对当前手牌。自动定位失败时，用【基础区域校准】标记手牌、摸牌与操作按钮，再通过【手动核对】学习牌面。使用【扩展区域校准】补充牌河、宝牌、点数等区域；模板未覆盖的牌需要继续标注。
@@ -242,7 +273,7 @@ Steam 模式通过屏幕截图、牌面模板与 OCR 获取信息，再使用同
 
 窗口绑定仅在本次运行有效。下次启动请确认采集范围或重新绑定；重新绑定 / 框选会清除当前模式的区域校准。自动绑定后，游戏窗口缩放会停止识别并要求重新校准；最小化或关闭时清除当前局面与建议，恢复可见后重新采集，重启游戏后需重新绑定。
 
-浏览器与 Steam 分别保存采集范围、区域校准和模板；模型 Key 共用。截图采集无法识别所有遮挡，也不支持后台 / 最小化采集；请关闭覆盖牌桌的其他窗口或 Steam 浮层。全屏、混合 DPI、游戏皮肤和动画场景仍需实际验证。
+两个独立版本分别保存 Key、采集范围、区域校准和模板，Key 需分别填写。原通用开发入口内切换模式时仍共用该入口的 Key。截图采集无法识别所有遮挡，也不支持后台 / 最小化采集；请关闭覆盖牌桌的其他窗口或 Steam 浮层。全屏、混合 DPI、游戏皮肤和动画场景仍需实际验证。
 
 ### 截图识别：四人局备用方式
 
@@ -340,7 +371,7 @@ python -m mahjong_jev_advisor.preflight --online --output readiness-report.json
 
 ## 配置与数据
 
-配置不存放在项目目录中：
+配置不存放在项目目录中。下表为网页版 / 原通用入口的目录；**独立 Steam 版将末尾目录名改为 `mahjong-jev-advisor-steam`**，与网页版互不覆盖：
 
 | 系统 | 默认目录 |
 | --- | --- |
@@ -348,7 +379,7 @@ python -m mahjong_jev_advisor.preflight --online --output readiness-report.json
 | macOS | `~/Library/Application Support/mahjong-jev-advisor/` |
 | 其他系统 | `${XDG_CONFIG_HOME:-~/.config}/mahjong-jev-advisor/` |
 
-目录中可能包含 `settings.json`、浏览器牌面模板 `templates/`、Steam 模板 `templates-steam/`，以及启用决策日志后生成的 `decisions.jsonl`。损坏配置重新保存时会备份为 `settings.invalid.json`。可用 `MAHJONG_ADVISOR_CONFIG_DIR` 指向独立目录进行开发或测试。
+目录中可能包含 `settings.json`、浏览器牌面模板 `templates/`、Steam 模板 `templates-steam/`，以及启用决策日志后生成的 `decisions.jsonl`。损坏配置重新保存时会备份为 `settings.invalid.json`。可用 `MAHJONG_ADVISOR_CONFIG_DIR` 指向独立目录进行开发或测试；此高级设置会覆盖默认隔离目录，不要给两个版本指定同一个目录。
 
 数据流与凭据处理：
 
@@ -412,14 +443,17 @@ CI 在 Windows 和 macOS 上安装项目、运行 pytest 和 JSONL 回放，最�
 
 ```bash
 python -m pip install -e '.[dev]' 'pyinstaller>=6.11,<7'
-python scripts/build_release.py
+python scripts/build_release.py --edition browser
+python scripts/build_release.py --edition steam
 ```
 
-Windows PowerShell 也可执行上述命令。产物在 `dist/`，包括带版本、系统及架构名称的 ZIP 和 SHA256 文件；已有同名目录时先移走旧产物。每个平台需要原生构建，不能在 macOS 上直接生成 Windows EXE。
+Windows PowerShell 也可执行上述命令。产物在 `dist/`，包括带版本、入口（browser / steam）、系统及架构名称的 ZIP 和 SHA256 文件；已有同名目录时先移走旧产物。每个平台需要原生构建，不能在 macOS 上直接生成 Windows EXE。
+
+构建前会核对已安装的项目版本与 `pyproject.toml` 是否一致；修改版本后需重新安装项目，否则会停止打包并提示修复。每次构建必须生成新的冒烟检查报告，报告中的网页版 / Steam 版身份也必须与目标一致，旧报告不能作为本次构建通过的依据。
 
 推荐在 GitHub Actions 的 **Portable release builds → Run workflow** 手动生成候选包。工作流运行回归测试后构建，再执行冻结应用的离线冒烟检查；任一步失败均不会上传可分发包。`build-diagnostics-*` 保存打包诊断。
 
-正式发布时，先修改 `pyproject.toml` 的版本、提交并推送，再推送匹配的 `v<版本号>` 标签。两个平台构建均成功后，工作流创建 **Draft Release** 并附上 ZIP 与校验文件；维护者检查后手动发布。标签与项目版本不一致时构建会失败，工作流也不会覆盖已公开 Release。
+正式发布时，先修改 `pyproject.toml` 的版本、提交并推送，再推送匹配的 `v<版本号>` 标签。两种入口在两个平台的四个构建均成功后，工作流创建 **Draft Release** 并附上 ZIP 与校验文件；维护者检查后手动发布。标签与项目版本不一致时构建会失败，工作流也不会覆盖已公开 Release 或同名附件。新功能使用独立分支和 PR 审查；不要强制覆盖 main 或旧标签。
 
 ### 数据处理流程
 

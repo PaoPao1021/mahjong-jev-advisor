@@ -17,17 +17,18 @@ import cv2
 import mss
 import numpy as np
 from PySide6.QtCore import QEvent, QPoint, QRect, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontDatabase, QIcon
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontDatabase, QIcon, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QLayout, QMainWindow, QMenu, QMessageBox,
     QScrollArea, QVBoxLayout, QWidget, QInputDialog,
 )
 
+from .edition import launch_edition
 from .desktop_capture import GameWindow, WindowUnavailable, client_box, game_windows
 from .jev import JevError, advise
 from .hook import HookBridge
 from .rules import (
-    NoDecision, UncertainState, candidates, danger, dora_value,
+    NoDecision, UncertainState, candidates, danger, dora_value, discard_comparison,
     shanten, shanten_text, ukeire_details, yaku_hints,
 )
 from .settings import Settings, append_decision_log, config_dir
@@ -38,12 +39,46 @@ from .ui_components import (
 )
 from .ui_dialogs import (
     JevSettingsDialog, LLMAnalysisDialog, LLMSettingsDialog, ManualStateDialog,
-    RegionDialog, TemplateDialog,
+    RegionDialog, TemplateDialog, DiscardComparisonDialog,
 )
 from .vision import (
     REGIONS, Observation, TemplateStore, VisionReader, detect_basic_regions,
     learn_templates_from_state,
 )
+
+
+class AdvisorScrollArea(QScrollArea):
+    """Forward only Ctrl-wheel input, never general Qt teardown events."""
+    opacity_wheel = Signal(object)
+
+    def wheelEvent(self, event: Any) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.opacity_wheel.emit(event)
+        else:
+            super().wheelEvent(event)
+
+
+def fit_window_geometry(saved: QRect, available: QRect) -> QRect:
+    """Keep the client rectangle inside a usable screen, reserving caption space."""
+    bounds = available.adjusted(8, 32, -8, -8)
+    width = min(max(320, saved.width()), bounds.width())
+    height = min(max(320, saved.height()), bounds.height())
+    return QRect(max(bounds.left(), min(saved.x(), bounds.right() - width + 1)),
+                 max(bounds.top(), min(saved.y(), bounds.bottom() - height + 1)), width, height)
+
+
+def capture_window_rect(window: QWidget) -> QRect:
+    """Match capture coordinates, including native Windows DPI and window chrome."""
+    if sys.platform == "win32":
+        from ctypes.wintypes import RECT
+        native_rect = RECT()
+        get_rect = ctypes.windll.user32.GetWindowRect
+        get_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+        get_rect.restype = ctypes.c_int
+        if get_rect(int(window.winId()), ctypes.byref(native_rect)):
+            return QRect(native_rect.left, native_rect.top,
+                         native_rect.right - native_rect.left, native_rect.bottom - native_rect.top)
+    return window.frameGeometry()
 
 
 def overlay_size_for_screen(available: QRect) -> tuple[int, int]:
@@ -160,10 +195,18 @@ def _demo_reference_state() -> GameState:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("雀魂 · Jev 实时切牌顾问")
+        edition_label = {"browser": " · 网页版", "steam": " · Steam 版（实验性）"}.get(launch_edition(), "")
+        self.setWindowTitle("雀魂 · Jev 实时切牌顾问" + edition_label)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
 
         self.settings = Settings.load()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.settings.always_on_top)
+        self._comparison_dialog = None
+        self._comparison_state_available = False
+        edition = launch_edition()
+        if edition:
+            # Recover settings imported from the other edition without mixing calibration.
+            self.settings.switch_input_source(edition)
         self._capture_excluded = False
         self._capture_generation = 0
         self._steam_window: GameWindow | None = None
@@ -212,12 +255,12 @@ class MainWindow(QMainWindow):
 
         # Keep controls visible while dense table and decision details scroll on
         # shorter screens (including 720p and scaled laptop displays).
-        self.content_scroll = QScrollArea(self)
+        self.content_scroll = AdvisorScrollArea(self)
         self.content_scroll.setObjectName("hudContentScroll")
         self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.content_scroll.setWidgetResizable(True)
         self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.content_scroll.viewport().installEventFilter(self)
+        self.content_scroll.opacity_wheel.connect(self.wheelEvent)
         content = QWidget()
         content.setObjectName("hudScrollableContent")
         content_layout = QVBoxLayout(content)
@@ -257,12 +300,19 @@ class MainWindow(QMainWindow):
         self.bottom_bar.llm_settings_clicked.connect(self.edit_llm_settings)
         self.bottom_bar.toggle_clicked.connect(self.toggle_recognition)
         self.bottom_bar.manual_clicked.connect(self.manual_state)
+        self.bottom_bar.compare_clicked.connect(self.show_discard_comparison)
         root_layout.addWidget(self.bottom_bar)
+        self.compare_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self.compare_shortcut.activated.connect(self.show_discard_comparison)
 
         self.setMinimumSize(320, 320)
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen is not None:
             self._adapt_to_screen(screen)
+            if self.settings.window_geometry:
+                saved = QRect(*self.settings.window_geometry)
+                target = QApplication.screenAt(saved.center()) or screen
+                self.setGeometry(fit_window_geometry(saved, target.availableGeometry()))
         else:
             self.resize(390, 720)
         self.setWindowOpacity(self.settings.opacity)
@@ -312,17 +362,6 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             super().wheelEvent(event)
-
-    def eventFilter(self, watched: Any, event: Any) -> bool:
-        if (
-            # Qt can deliver teardown events after the scroll area is deleted.
-            event.type() == QEvent.Type.Wheel
-            and watched is self.content_scroll.viewport()
-            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        ):
-            self.wheelEvent(event)
-            return True
-        return super().eventFilter(watched, event)
 
     def _load_initial_preview(self) -> None:
         """Loads a demo state resembling the reference image so UI looks spectacular out-of-the-box."""
@@ -410,6 +449,7 @@ class MainWindow(QMainWindow):
     def _on_ai_menu(self) -> None:
         menu = QMenu(self)
         menu.addAction("立即重新获取建议", self._force_recompute_advice)
+        menu.addAction("比较所有切法（本地）", self.show_discard_comparison)
         menu.addAction("大模型深度牌理解析 (LLM)", self.show_llm_analysis)
         menu.addAction("Jev 设置 (API Key)", self.edit_jev_settings)
         menu.addAction("大模型设置 (LLM)", self.edit_llm_settings)
@@ -419,16 +459,22 @@ class MainWindow(QMainWindow):
 
     def _on_table_menu(self) -> None:
         menu = QMenu(self)
-        source_menu = menu.addMenu("输入来源")
-        for source, label in (("browser", "浏览器（Hook 优先）"), ("steam", "Steam 客户端（截图）")):
-            action = source_menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(self.settings.input_source == source)
-            action.triggered.connect(lambda checked=False, value=source: self.set_input_source(value))
-        menu.addAction("绑定 Steam 雀魂窗口（Windows）", self.bind_steam_window)
+        edition = launch_edition()
+        if not edition:
+            source_menu = menu.addMenu("输入来源")
+            for source, label in (("browser", "浏览器（Hook 优先）"), ("steam", "Steam 客户端（截图）")):
+                action = source_menu.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(self.settings.input_source == source)
+                action.triggered.connect(lambda checked=False, value=source: self.set_input_source(value))
+        else:
+            menu.addAction("网页版" if edition == "browser" else "Steam 版（实验性）").setEnabled(False)
+        if edition != "browser":
+            menu.addAction("绑定 Steam 雀魂窗口（Windows）", self.bind_steam_window)
         menu.addSeparator()
-        menu.addAction("打开网页 Hook 扩展目录", self.open_hook_extension)
-        menu.addAction("查看网页 Hook 诊断", self.show_hook_diagnostic)
+        if edition != "steam":
+            menu.addAction("打开网页 Hook 扩展目录", self.open_hook_extension)
+            menu.addAction("查看网页 Hook 诊断", self.show_hook_diagnostic)
         menu.addSeparator()
         menu.addAction("选择牌桌画面", self.select_game)
         menu.addAction("基础区域校准", lambda: self.calibrate(False))
@@ -436,6 +482,11 @@ class MainWindow(QMainWindow):
         menu.addAction("标注牌面样本", self.label_templates)
         menu.addAction("保存当前帧截图", self.save_frame)
         menu.addSeparator()
+        pin = menu.addAction("窗口置顶")
+        pin.setCheckable(True)
+        pin.setChecked(self.settings.always_on_top)
+        pin.triggered.connect(self.set_always_on_top)
+        menu.addAction("恢复窗口大小与位置", self.reset_window_layout)
         op_menu = menu.addMenu("窗口透明度")
         for val, title in [
             (1.0, "100% 完全不透明"),
@@ -447,7 +498,34 @@ class MainWindow(QMainWindow):
             op_menu.addAction(title, lambda v=val: self._select_opacity(v))
         menu.exec(self.title_bar.btn_table.mapToGlobal(QPoint(0, self.title_bar.btn_table.height() + 2)))
 
+    def set_always_on_top(self, enabled: bool) -> None:
+        self.settings.always_on_top = enabled
+        self.settings.save()
+        geometry = self.geometry()
+        visible = self.isVisible()
+        state = self.windowState()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        self._capture_excluded = False
+        self.setGeometry(geometry)
+        self.setWindowState(state)
+        if visible:
+            self.show()
+        self.bottom_bar.set_status_info("窗口已置顶" if enabled else "已取消置顶", "可在【桌】菜单切换")
+
+    def reset_window_layout(self) -> None:
+        screen = QApplication.screenAt(QCursor.pos()) or self.screen()
+        self.showNormal()
+        self._adapt_to_screen(screen)
+        available = screen.availableGeometry()
+        self.setGeometry(fit_window_geometry(QRect(available.left() + 24, available.top() + 48,
+                                                   self.width(), self.height()), available))
+        self.settings.window_geometry = self.geometry().getRect()
+        self.settings.save()
+        self.bottom_bar.set_status_info("窗口已恢复", "已移回当前屏幕，位置与大小会在关闭时保存")
+
     def set_input_source(self, source: str) -> None:
+        if launch_edition() and source != launch_edition():
+            return
         if source == self.settings.input_source:
             return
         self.running = False
@@ -562,6 +640,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "网页 Hook 诊断", detail)
 
     def _render_state(self, state: GameState, highlight_tile: str | None = None) -> None:
+        self._comparison_state_available = True
+        if self._comparison_dialog is not None:
+            self._comparison_dialog.mark_current_state(state)
         # Hand & drawn tile
         self.hand_widget.set_hand(state.hand, highlight_tile=highlight_tile)
 
@@ -597,7 +678,7 @@ class MainWindow(QMainWindow):
         if threats > 0:
             fold_rate = min(95, max(15, 20 + threats * 25 + raw_danger * 5))
         else:
-            fold_rate = max(5, min(40, (chosen.shanten or 1) * 12))
+            fold_rate = max(5, min(40, (chosen.shanten if chosen.shanten is not None else 1) * 12))
 
         opts: list[Candidate] = []
         try:
@@ -701,7 +782,7 @@ class MainWindow(QMainWindow):
             probabilities=bar_items,
             fold_rate=fold_rate,
             danger_score=danger_score,
-            draw_info=f"摸切 {chosen.ukeire or 6}" if rec_tile == (state.hand[-1] if state.hand else "") else "手切",
+            draw_info=f"有效牌 {chosen.ukeire} 张" if chosen.ukeire is not None else "有效牌未知",
             melds_count=state.open_melds,
             alternatives=alternatives_list,
             source_note=source_note,
@@ -836,6 +917,13 @@ class MainWindow(QMainWindow):
     def toggle_recognition(self) -> None:
         if self.running:
             self._capture_generation += 1
+            self.pending_identity = None
+            self.advised_identity = None
+            self.stable_count = 0
+            self._current_chosen = None
+            self.hero_card.update_decision(action_name="已暂停", rec_tile="", shanten_num=None,
+                confidence=None, probabilities=[], alternatives=[], source_note="实时建议已暂停",
+                raw_detail="点击【开始识别】恢复；暂停前的请求结果不会显示。")
             self.running = False
             self.timer.stop()
             self.bottom_bar.btn_toggle.setText("开始识别")
@@ -920,6 +1008,12 @@ class MainWindow(QMainWindow):
         self._demo_preview = False
         self._render_state(state)
         if not self.running:
+            self.pending_identity = None
+            self.advised_identity = None
+            self._current_chosen = None
+            self.hero_card.update_decision(action_name="已暂停", rec_tile="", shanten_num=None,
+                confidence=None, probabilities=[], alternatives=[], source_note="实时建议已暂停",
+                raw_detail="已收到新牌面，开始识别后生成当前局面的建议。")
             self.bottom_bar.set_status_info("已捕获牌局状态", "点击【开始识别】开启 AI 自动切牌建议")
             return
         if not self._hook_active:
@@ -945,17 +1039,12 @@ class MainWindow(QMainWindow):
             return
         if not self._update_steam_window():
             return
-        capture_rect = self.geometry()
-        if sys.platform == "win32":
-            from ctypes.wintypes import RECT
-            native_rect = RECT()
-            get_rect = ctypes.windll.user32.GetWindowRect
-            get_rect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
-            get_rect.restype = ctypes.c_int
-            if get_rect(int(self.winId()), ctypes.byref(native_rect)):
-                capture_rect = QRect(native_rect.left, native_rect.top,
-                    native_rect.right - native_rect.left, native_rect.bottom - native_rect.top)
-        if not self._capture_excluded and capture_rect.intersects(QRect(*self.settings.game_box)):
+        game_rect = QRect(*self.settings.game_box)
+        comparison = self._comparison_dialog
+        if comparison is not None and comparison.isVisible() and capture_window_rect(comparison).intersects(game_rect):
+            self.on_capture_failure("切牌比较窗口遮挡了牌桌，请移开或关闭后继续识别")
+            return
+        if not self._capture_excluded and capture_window_rect(self).intersects(game_rect):
             self.on_capture_failure("顾问窗口遮挡了牌桌，无法取得当前画面")
             self.bottom_bar.set_status_info("窗口遮挡牌桌", "系统不支持排除悬浮窗，请把顾问窗口移到牌桌区域外")
             return
@@ -974,6 +1063,9 @@ class MainWindow(QMainWindow):
             self.show()
 
     def on_capture_failure(self, error: str) -> None:
+        self._comparison_state_available = False
+        if self._comparison_dialog is not None:
+            self._comparison_dialog.mark_current_state(None)
         self._show_after_capture()
         self.capture_busy = False
         self.pending_identity = None
@@ -999,7 +1091,11 @@ class MainWindow(QMainWindow):
                 self.hand_widget.set_hand(observation.debug["recognized_hand"])
 
         if observation.problems or observation.state is None or observation.confidence < 0.90:
+            self._comparison_state_available = False
+            if self._comparison_dialog is not None:
+                self._comparison_dialog.mark_current_state(None)
             self.pending_identity = None
+            self.advised_identity = None
             self.stable_count = 0
             self._current_chosen = None
             self.hero_card.update_decision(action_name="待核对", rec_tile="", shanten_num=None,
@@ -1016,6 +1112,10 @@ class MainWindow(QMainWindow):
             self.pending_identity = identity
             self.stable_count = 1
             self.advised_identity = None
+            self._current_chosen = None
+            self.hero_card.update_decision(action_name="确认牌面", rec_tile="", shanten_num=None,
+                confidence=None, probabilities=[], alternatives=[], source_note="牌面已变化 · 等待稳定识别",
+                raw_detail="连续两次识别一致后，再生成新建议。")
 
         if self.stable_count >= 2 and identity != self.advised_identity and not self.advice_busy:
             self.start_advice(observation.state)
@@ -1128,6 +1228,35 @@ class MainWindow(QMainWindow):
             self.settings.save()
             self.bottom_bar.set_status_info("大模型设置已保存", f"模型：{self.settings.llm_model}")
 
+    def show_discard_comparison(self) -> None:
+        state = self.last_state
+        if state is None:
+            QMessageBox.information(self, "暂无局面", "请先识别牌桌或手动核对手牌。")
+            return
+        try:
+            options = discard_comparison(state)
+        except (ValueError, NoDecision, UncertainState) as error:
+            QMessageBox.information(self, "暂时无法比较", str(error))
+            return
+        if self._comparison_dialog is None:
+            dialog = DiscardComparisonDialog(state, options, self)
+            self._comparison_dialog = dialog
+            dialog.refresh_requested.connect(self.show_discard_comparison)
+            dialog.finished.connect(self._close_comparison)
+        else:
+            self._comparison_dialog.set_snapshot(state, options)
+        if not self._comparison_state_available:
+            self._comparison_dialog.mark_current_state(None)
+        self._comparison_dialog.show()
+        self._comparison_dialog.raise_()
+        self._comparison_dialog.activateWindow()
+
+    def _close_comparison(self, result: int) -> None:
+        dialog = self._comparison_dialog
+        self._comparison_dialog = None
+        if dialog is not None:
+            dialog.deleteLater()
+
     def show_llm_analysis(self) -> None:
         """Launches LLM deep tactical analysis dialog."""
         if self._demo_preview or not self.last_state or not self.last_state.hand:
@@ -1189,8 +1318,8 @@ class MainWindow(QMainWindow):
             action_name="模拟切牌",
             rec_tile=tile,
             shanten_num=s,
-            confidence=1.0,
-            probabilities=[(tile, 85, True)],
+            confidence=None,
+            probabilities=[],
             fold_rate=fold_rate,
             danger_score=danger_score,
             draw_info="手动模拟",
@@ -1242,6 +1371,15 @@ class MainWindow(QMainWindow):
             self._begin_realtime(f"已学习 {learned} 个当前牌面样本 · 后续变化自动识别")
 
     def closeEvent(self, event: Any) -> None:
+        if self._comparison_dialog is not None:
+            self._comparison_dialog.close()
+        rectangle = self.normalGeometry() if self.isMaximized() or self.isMinimized() else self.geometry()
+        if rectangle.isValid():
+            self.settings.window_geometry = rectangle.getRect()
+            try:
+                self.settings.save()
+            except OSError:
+                pass  # Closing must still work if the configuration directory is read-only.
         self.timer.stop()
         self.running = False
         self.pool.waitForDone(1000)
@@ -1721,6 +1859,10 @@ QDialog QScrollArea {
     background: transparent;
     border: 1px solid rgba(51, 65, 85, 0.5);
     border-radius: 6px;
+}
+QPushButton:focus, QPushButton#hudGhostBtn:focus, QPushButton#hudPrimaryBtn:focus,
+QPushButton#headerPillBtn:focus {
+    border: 1px solid #38bdf8;
 }
 """
 

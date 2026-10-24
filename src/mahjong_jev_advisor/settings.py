@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .edition import default_input_source, launch_edition
+
 
 def config_dir() -> Path:
     override = os.environ.get("MAHJONG_ADVISOR_CONFIG_DIR")
@@ -23,14 +25,14 @@ def config_dir() -> Path:
         base = Path.home() / "Library" / "Application Support"
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "mahjong-jev-advisor"
+    return base / ("mahjong-jev-advisor-steam" if launch_edition() == "steam" else "mahjong-jev-advisor")
 
 
 @dataclass
 class Settings:
     game_box: tuple[int, int, int, int] | None = None
     regions: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
-    input_source: str = "browser"
+    input_source: str = field(default_factory=default_input_source)
     capture_profiles: dict[str, Any] = field(default_factory=dict)
     api_key: str = ""
     model_endpoint: str = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model"
@@ -45,6 +47,8 @@ class Settings:
     llm_model: str = "deepseek-chat"
     show_table: bool = True
     opacity: float = 1.0
+    always_on_top: bool = True
+    window_geometry: tuple[int, int, int, int] | None = None
     load_warning: str = ""
 
     @classmethod
@@ -67,7 +71,7 @@ class Settings:
         }.get((protocol, f"{urlsplit(endpoint).scheme}://{urlsplit(endpoint).netloc}"))
 
         return cls(
-            input_source=data.get("input_source", "browser"),
+            input_source=data.get("input_source", default_input_source()),
             capture_profiles=data.get("capture_profiles", {}),
             game_box=tuple(data["game_box"]) if data.get("game_box") else None,
             regions={k: tuple(v) for k, v in data.get("regions", {}).items()},
@@ -83,6 +87,8 @@ class Settings:
             llm_base_url=str(data.get("llm_base_url", "")),
             llm_api_key=str(data.get("llm_api_key", "")),
             llm_model=str(data.get("llm_model", "deepseek-chat")),
+            always_on_top=data.get("always_on_top", True),
+            window_geometry=tuple(data["window_geometry"]) if data.get("window_geometry") else None,
             show_table=bool(data.get("show_table", True)),
             opacity=max(0.45, min(1.0, float(data.get("opacity", 1.0)))) if data.get("ui_revision") == 2 else 1.0,
         )
@@ -104,12 +110,17 @@ class Settings:
             if key in data and not isinstance(data[key], str):
                 raise ValueError("Invalid text field")
         urlsplit(data.get("model_endpoint", Settings.model_endpoint))
-        for key in ("local_fallback", "logging_enabled", "show_table"):
+        for key in ("local_fallback", "logging_enabled", "show_table", "always_on_top"):
             if key in data and type(data[key]) is not bool:
                 raise ValueError("Invalid boolean field")
         for key in ("model_timeout", "ui_interval_ms", "opacity"):
             if key in data and (type(data[key]) not in (float, int) or not math.isfinite(data[key])):
                 raise ValueError("Invalid numeric field")
+        geometry = data.get("window_geometry")
+        if geometry is not None and (not isinstance(geometry, (list, tuple)) or len(geometry) != 4
+                or any(type(v) is not int or abs(v) > 100000 for v in geometry)
+                or geometry[2] <= 0 or geometry[3] <= 0):
+            raise ValueError("Invalid window geometry")
         box = data.get("game_box")
         if box is not None and (not isinstance(box, (list, tuple)) or len(box) != 4
                 or any(type(v) is not int for v in box) or box[2] <= 0 or box[3] <= 0):
@@ -145,6 +156,8 @@ class Settings:
             "llm_api_key": self.llm_api_key,
             "llm_model": self.llm_model,
             "show_table": self.show_table,
+            "always_on_top": self.always_on_top,
+            "window_geometry": self.window_geometry,
             "opacity": self.opacity,
             "ui_revision": 2,
         }

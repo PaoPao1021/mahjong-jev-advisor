@@ -49,6 +49,27 @@ def test_custom_configuration_survives_restart():
     assert restored.connection() == settings.connection()
 
 
+@pytest.mark.parametrize('geometry', [[0, 0, 0, 720], [0, 0, -20, 720], [0, 0, 400],
+                                      [True, 0, 400, 720], [0, 0, 400, float('nan')]])
+def test_invalid_window_geometry_is_rejected(geometry):
+    with pytest.raises(ValueError, match='window geometry'):
+        Settings._validate_data({'window_geometry': geometry})
+
+
+def test_window_preferences_are_backward_compatible():
+    from mahjong_jev_advisor.settings import config_dir
+    path = config_dir() / 'settings.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{}', encoding='utf-8')
+    assert Settings.load().always_on_top is True
+    assert Settings.load().window_geometry is None
+    settings = Settings(always_on_top=False, window_geometry=(-1000, 50, 400, 600))
+    settings.save()
+    restored = Settings.load()
+    assert restored.window_geometry == settings.window_geometry
+    assert restored.always_on_top is False
+
+
 @pytest.mark.parametrize('failures', [1, 2, 3])
 def test_transient_advice_retries_are_bounded(monkeypatch, failures):
     from mahjong_jev_advisor import jev

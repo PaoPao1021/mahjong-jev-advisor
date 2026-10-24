@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QScrollArea, QSpinBox, QDoubleSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QApplication,
 )
 
 from .settings import Settings
@@ -64,6 +65,132 @@ def make_dialog_header(title: str, subtitle: str, badge_text: str | None = None)
         lbl_sub.setWordWrap(True)
         layout.addWidget(lbl_sub)
     return banner
+
+
+class DiscardComparisonDialog(QDialog):
+    """Non-modal, refreshable comparison with an explicit immutable snapshot."""
+    refresh_requested = Signal()
+
+    def __init__(self, state: GameState, options: tuple[Candidate, ...], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("切牌比较 · 局面快照")
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(400, 380)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+        layout.addWidget(make_dialog_header("比较每一种切法", "点击列标题排序，选择一行查看完整牌理。", "本地分析"))
+        self.snapshot_label = QLabel()
+        self.snapshot_label.setWordWrap(True)
+        layout.addWidget(self.snapshot_label)
+        self.freshness_label = QLabel()
+        self.freshness_label.setWordWrap(True)
+        layout.addWidget(self.freshness_label)
+        self.table = QTableWidget(0, 6)
+        self.table.setAccessibleName("切牌方案比较")
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet("""
+            QTableWidget { background: #0f172a; alternate-background-color: #172238;
+                color: #e2e8f0; gridline-color: #334155; border: 1px solid #334155;
+                selection-background-color: #164e63; selection-color: #ffffff; }
+            QTableWidget:focus { border: 1px solid #38bdf8; }
+            QHeaderView::section { background: #1e293b; color: #cbd5e1;
+                padding: 7px; border: none; border-right: 1px solid #334155; }
+            QScrollBar:horizontal { background: #0f172a; height: 12px; margin: 0; }
+            QScrollBar:vertical { background: #0f172a; width: 12px; margin: 0; }
+            QScrollBar::handle { background: #475569; border-radius: 5px; min-width: 24px; min-height: 24px; }
+            QScrollBar::handle:hover { background: #64748b; }
+            QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+            QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+            QAbstractScrollArea::corner { background: #0f172a; }
+        """)
+        self.headers = ["切牌", "向听", "进张（张）", "危险级", "弃宝牌", "有效牌"]
+        self.table.setHorizontalHeaderLabels(self.headers)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.verticalHeader().hide()
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemSelectionChanged.connect(self._show_detail)
+        layout.addWidget(self.table, 1)
+        self.detail_label = QLabel("选择一行查看牌理")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setMinimumHeight(42)
+        self.detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.detail_label)
+        note = QLabel("0 向听 = 听牌。进张按可见牌估算，危险级为相对指标；操作限制请以游戏为准。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.feedback_label = QLabel("无需 API Key · 不会在游戏中执行操作")
+        self.feedback_label.setWordWrap(True)
+        layout.addWidget(self.feedback_label)
+        buttons = QHBoxLayout()
+        self.refresh_button = QPushButton("刷新局面")
+        self.refresh_button.setToolTip("使用主窗口当前已识别的牌面重新比较（Ctrl+R）")
+        self.refresh_button.setShortcut("Ctrl+R")
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        buttons.addWidget(self.refresh_button)
+        self.copy_button = QPushButton("复制比较表")
+        self.copy_button.clicked.connect(self.copy_table)
+        buttons.addWidget(self.copy_button)
+        buttons.addStretch()
+        self.close_button = QPushButton("关闭")
+        self.close_button.clicked.connect(self.accept)
+        buttons.addWidget(self.close_button)
+        for button in (self.refresh_button, self.copy_button, self.close_button):
+            button.setAutoDefault(False)
+            button.setMinimumHeight(32)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout.addLayout(buttons)
+        self.set_snapshot(state, options)
+        screen = parent.screen() if parent is not None else QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else QRect(0, 0, 800, 650)
+        self.resize(min(780, max(400, available.width() - 32)), min(600, max(380, available.height() - 64)))
+
+    def set_snapshot(self, state: GameState, options: tuple[Candidate, ...]) -> None:
+        self.snapshot_identity = state.identity()
+        self.snapshot_label.setText(f"{state.player_count}人麻将 · 手牌：{' '.join(state.hand)}")
+        self.table.setSortingEnabled(False)
+        self.table.clearContents()
+        self.table.setRowCount(len(options))
+        for row, candidate in enumerate(options):
+            values = [candidate.tile, candidate.shanten, candidate.ukeire, candidate.danger,
+                      candidate.dora_loss, " ".join(candidate.improving_tiles) or "—"]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.DisplayRole, value if value is not None else "—")
+                item.setData(Qt.ItemDataRole.UserRole, candidate.rationale)
+                item.setToolTip(candidate.rationale)
+                self.table.setItem(row, column, item)
+        self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.table.setSortingEnabled(True)
+        self.mark_current_state(state)
+        self.feedback_label.setText(f"已载入 {len(options)} 种切法 · 本地分析")
+        if options:
+            self.table.selectRow(0)
+
+    def mark_current_state(self, state: GameState | None) -> None:
+        fresh = state is not None and state.identity() == self.snapshot_identity
+        if state is None:
+            message = "当前画面不可用 · 下表保留旧快照，待识别恢复后刷新"
+        elif fresh:
+            message = "当前局面快照 · 可同时操作主窗口"
+        else:
+            message = "牌面已变化 · 点击「刷新局面」更新；下表保留旧快照"
+        self.freshness_label.setText(message)
+        self.freshness_label.setStyleSheet("color: #94a3b8;" if fresh else "color: #fbbf24;")
+
+    def _show_detail(self) -> None:
+        selected = self.table.selectedItems()
+        self.detail_label.setText(selected[0].data(Qt.ItemDataRole.UserRole) if selected else "选择一行查看牌理")
+
+    def copy_table(self) -> None:
+        rows = ["\t".join(self.headers)]
+        for row in range(self.table.rowCount()):
+            rows.append("\t".join(self.table.item(row, col).text() for col in range(self.table.columnCount())))
+        QApplication.clipboard().setText("\n".join(rows))
+        self.feedback_label.setText(f"已复制 {self.table.rowCount()} 种切法，可粘贴到表格或聊天中")
 
 
 class SelectionCanvas(QWidget):

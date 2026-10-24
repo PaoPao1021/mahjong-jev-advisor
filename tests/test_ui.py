@@ -451,3 +451,284 @@ def test_steam_capture_worker_delivers_on_gui_thread(qapp, monkeypatch):
         assert not window.capture_busy
     finally:
         window.close()
+
+
+@pytest.mark.parametrize("edition", ["browser", "steam"])
+def test_edition_entry_uses_own_mode_and_does_not_switch(qapp, monkeypatch, edition):
+    monkeypatch.setenv("MAHJONG_ADVISOR_EDITION", edition)
+    window = MainWindow()
+    try:
+        assert window.settings.input_source == edition
+        assert ("Steam" in window.windowTitle()) == (edition == "steam")
+        window.set_input_source("browser" if edition == "steam" else "steam")
+        assert window.settings.input_source == edition
+        if edition == "steam":
+            assert not window.hook.connected and not window.running
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_pause_discards_inflight_result_and_does_not_restart(qapp, monkeypatch, failed):
+    from mahjong_jev_advisor.state import Advice, Candidate
+    window = MainWindow()
+    state = _demo_reference_state()
+    window.last_state = state
+    window.pending_identity = state.identity()
+    window.running = True
+    window.advice_busy = True
+    window.stable_count = 2
+    started = []
+    monkeypatch.setattr(window, 'start_advice', started.append)
+    try:
+        window.toggle_recognition()
+        if failed:
+            window.on_advice_failure((state.identity(), 'late failure'))
+        else:
+            window.on_advice((state.identity(), Advice(Candidate('discard', '2s', 'old', 'old')), state))
+        assert not started and not window.running
+        assert window.pending_identity is None
+        assert window._current_chosen is None
+        assert not window.hero_card.rec_tile
+        assert '暂停' in window.hero_card.source_label.text()
+    finally:
+        window.close()
+
+
+def test_changed_capture_clears_old_advice_before_stabilizing(qapp, monkeypatch):
+    from dataclasses import replace
+    from mahjong_jev_advisor.vision import Observation
+    window = MainWindow()
+    window._load_initial_preview()
+    old = window.last_state
+    window.pending_identity = window.advised_identity = old.identity()
+    window.running = True
+    window.manual = False
+    latest = replace(old, honba=old.honba + 1)
+    started = []
+    monkeypatch.setattr(window, 'start_advice', started.append)
+    try:
+        frame = Observation(latest, 0.99, (), {})
+        window.on_observation(frame)
+        assert not started and window.stable_count == 1
+        assert window._current_chosen is None and not window.hero_card.rec_tile
+        window.on_observation(frame)
+        assert started == [latest]
+    finally:
+        window.close()
+
+
+def test_uncertain_capture_then_same_hand_requests_fresh_advice(qapp, monkeypatch):
+    from mahjong_jev_advisor.vision import Observation
+    window = MainWindow()
+    state = _demo_reference_state()
+    window.running = True
+    window.manual = False
+    window.pending_identity = window.advised_identity = state.identity()
+    started = []
+    monkeypatch.setattr(window, 'start_advice', started.append)
+    try:
+        window.on_observation(Observation(None, 0.1, ('uncertain',), {}))
+        window.on_observation(Observation(state, 0.99, (), {}))
+        window.on_observation(Observation(state, 0.99, (), {}))
+        assert started == [state]
+    finally:
+        window.close()
+
+
+def test_paused_hook_clears_old_candidate(qapp):
+    from dataclasses import replace
+    window = MainWindow()
+    window._load_initial_preview()
+    window.running = False
+    try:
+        window.on_hook_state(replace(window.last_state, honba=1))
+        assert window._current_chosen is None and not window.hero_card.rec_tile
+        assert window.pending_identity is None
+    finally:
+        window.close()
+
+
+def test_simulation_has_no_invented_probability(qapp):
+    window = MainWindow()
+    try:
+        window._load_initial_preview()
+        window.on_hand_tile_clicked('2s')
+        assert window.hero_card.bars_layout.count() == 0
+        assert window.hero_card.confidence_pill.text() == '未提供置信度'
+    finally:
+        window.close()
+
+
+def test_zero_ukeire_is_displayed_without_inventing_draw_status(qapp):
+    from mahjong_jev_advisor.state import Advice, Candidate
+    window = MainWindow()
+    state = _demo_reference_state()
+    window.pending_identity = state.identity()
+    chosen = Candidate('discard', state.hand[-1], 'discard', 'test', shanten=0, ukeire=0)
+    try:
+        window.on_advice((state.identity(), Advice(chosen), state))
+        assert window.hero_card.pill_draw_status.text() == '有效牌 0 张'
+    finally:
+        window.close()
+
+
+def test_ctrl_wheel_changes_opacity_and_regular_wheel_does_not(qapp):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QWheelEvent
+    window = MainWindow()
+    try:
+        window.show()
+        window.set_opacity(0.8)
+        for modifiers, expected in [(Qt.KeyboardModifier.NoModifier, 0.8),
+                                    (Qt.KeyboardModifier.ControlModifier, 0.85)]:
+            event = QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, 120),
+                                Qt.MouseButton.NoButton, modifiers, Qt.ScrollPhase.NoScrollPhase, False)
+            QApplication.sendEvent(window.content_scroll.viewport(), event)
+            assert window.settings.opacity == pytest.approx(expected)
+    finally:
+        window.close()
+
+
+def test_comparison_table_numeric_sort_and_copy(qapp):
+    from mahjong_jev_advisor.rules import discard_comparison
+    from mahjong_jev_advisor.ui_dialogs import DiscardComparisonDialog
+    state = _demo_reference_state()
+    rows = discard_comparison(state)
+    dialog = DiscardComparisonDialog(state, rows)
+    try:
+        assert dialog.table.rowCount() == len(set(state.hand))
+        assert [dialog.table.item(i, 0).text() for i in range(len(rows))] == [c.tile for c in rows]
+        dialog.table.sortItems(2, Qt.SortOrder.AscendingOrder)
+        counts = [int(dialog.table.item(i, 2).text()) for i in range(len(rows))]
+        assert counts == sorted(c.ukeire for c in rows)
+        dialog.copy_table()
+        text = QApplication.clipboard().text()
+        assert len(text.splitlines()) == len(rows) + 1
+        assert '进张（张）' in text and '危险级' in text
+        assert text.splitlines()[1].split('\t')[0] == dialog.table.item(0, 0).text()
+    finally:
+        dialog.close()
+
+
+def test_comparison_unavailable_hand_shows_notice_without_dialog(qapp, monkeypatch):
+    from mahjong_jev_advisor import app as module
+    from mahjong_jev_advisor.state import GameState
+    window = MainWindow()
+    notices = []
+    monkeypatch.setattr(module.QMessageBox, 'information', lambda *args: notices.append(args))
+    window.last_state = GameState.from_dict({'hand': '123m456p789s123z5m'})
+    try:
+        window.show_discard_comparison()
+        assert notices and '暂时无法比较' in notices[0]
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize('available,saved', [
+    (QRect(0, 0, 1280, 720), QRect(3000, 2000, 450, 640)),
+    (QRect(-1920, 0, 1920, 1080), QRect(-1800, 80, 450, 640)),
+    (QRect(0, 0, 800, 600), QRect(-200, -100, 1600, 1200)),
+])
+def test_saved_window_fits_available_screen(available, saved):
+    from mahjong_jev_advisor.app import fit_window_geometry
+    fitted = fit_window_geometry(saved, available)
+    assert available.adjusted(8, 32, -8, -8).contains(fitted)
+    if available.adjusted(8, 32, -8, -8).contains(saved):
+        assert fitted == saved
+
+
+def test_window_preferences_survive_restart(qapp):
+    from mahjong_jev_advisor.settings import Settings
+    from mahjong_jev_advisor.app import fit_window_geometry
+    window = MainWindow()
+    window.show()
+    qapp.processEvents()
+    desired = fit_window_geometry(QRect(70, 90, 410, 510), window.screen().availableGeometry())
+    window.setGeometry(desired)
+    window.set_always_on_top(False)
+    qapp.processEvents()
+    saved = window.geometry()
+    window.close()
+    assert Settings.load().window_geometry == saved.getRect()
+    restored = MainWindow()
+    try:
+        assert not restored.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+        assert restored.geometry() == saved
+    finally:
+        restored.close()
+
+
+def test_comparison_reuses_window_refreshes_and_marks_stale(qapp):
+    from mahjong_jev_advisor.state import GameState
+    window = MainWindow()
+    window._load_initial_preview()
+    try:
+        window.show_discard_comparison()
+        dialog = window._comparison_dialog
+        assert dialog.isVisible() and not dialog.isModal()
+        window.show_discard_comparison()
+        assert window._comparison_dialog is dialog
+        original = dialog.snapshot_identity
+        changed = GameState.from_dict({'hand': '123m456p789s123z55m'})
+        window.last_state = changed
+        window._render_state(changed)
+        assert '牌面已变化' in dialog.freshness_label.text()
+        assert dialog.snapshot_identity == original
+        QTest.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+        assert dialog.snapshot_identity == changed.identity()
+        assert '当前局面快照' in dialog.freshness_label.text()
+        dialog.table.selectRow(1)
+        assert dialog.detail_label.text() == dialog.table.item(1, 0).data(Qt.ItemDataRole.UserRole)
+        QTest.mouseClick(dialog.copy_button, Qt.MouseButton.LeftButton)
+        assert '已复制' in dialog.feedback_label.text()
+        window.on_capture_failure('采集失败')
+        QTest.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+        assert '当前画面不可用' in dialog.freshness_label.text()
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+        assert window._comparison_dialog is None
+    finally:
+        window.close()
+
+
+def test_comparison_overlap_blocks_capture_until_moved(qapp, monkeypatch):
+    from mahjong_jev_advisor import app as module
+    window = MainWindow()
+    window._load_initial_preview()
+    window.show_discard_comparison()
+    comparison = window._comparison_dialog
+    window.running, window.manual = True, False
+    window._capture_excluded = True
+    window.settings.game_box = (0, 0, 800, 600)
+    monkeypatch.setattr(window, '_update_steam_window', lambda: True)
+    rect = [QRect(100, 100, 400, 400)]
+    monkeypatch.setattr(module, 'capture_window_rect', lambda _: rect[0])
+    started = []
+    monkeypatch.setattr(window.pool, 'start', started.append)
+    try:
+        window.capture_tick()
+        assert not started
+        assert '切牌比较窗口遮挡' in window.bottom_bar.status_summary.text()
+        assert '不可用' in comparison.freshness_label.text()
+        rect[0] = QRect(900, 0, 400, 400)
+        window.capture_tick()
+        assert len(started) == 1
+    finally:
+        window.close()
+
+
+def test_compact_action_bar_tab_order_and_bounds(qapp):
+    bar = BottomActionBar()
+    bar.resize(320, bar.sizeHint().height())
+    bar.show()
+    qapp.processEvents()
+    buttons = (bar.btn_ai, bar.btn_compare, bar.btn_explain, bar.btn_jev,
+               bar.btn_llm, bar.btn_clear, bar.btn_toggle, bar.btn_manual)
+    try:
+        for index, button in enumerate(buttons):
+            assert bar.rect().contains(button.geometry())
+            assert button.width() >= button.minimumSizeHint().width()
+            if index + 1 < len(buttons):
+                assert button.nextInFocusChain() is buttons[index + 1]
+    finally:
+        bar.close()

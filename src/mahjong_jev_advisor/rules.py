@@ -189,7 +189,13 @@ def shanten_text(s: int) -> str:
     return f"{s}向听"
 
 
-def _discard_candidates(state: GameState) -> list[Candidate]:
+def discard_comparison(state: GameState) -> tuple[Candidate, ...]:
+    """Compare every distinct discard locally, without changing online candidate IDs."""
+    state.validate()
+    if state.observation_confidence < 0.90:
+        raise UncertainState("识别置信度不足 0.90，请手动核对牌面")
+    if len(state.hand) != 14 - 3 * state.open_melds:
+        raise NoDecision("需要摸牌后的完整手牌才能比较切法，请先手动核对")
     seen: set[str] = set()
     scored: list[Candidate] = []
     for tile in state.hand:
@@ -242,7 +248,12 @@ def _discard_candidates(state: GameState) -> list[Candidate]:
         scored.sort(key=lambda c: (c.danger, c.shanten, -c.ukeire, c.dora_loss, index(c.tile)))
     else:
         scored.sort(key=lambda c: (c.shanten, -c.ukeire, c.dora_loss, c.danger, index(c.tile)))
-    top = scored[:3]
+    return tuple(scored)
+
+
+def _discard_candidates(state: GameState) -> list[Candidate]:
+    scored = discard_comparison(state)
+    top = list(scored[:3])
     if "riichi" in state.buttons and state.open_melds == 0:
         riichi_tiles = [c for c in scored if c.shanten == 0][:3]
         for c in riichi_tiles:
