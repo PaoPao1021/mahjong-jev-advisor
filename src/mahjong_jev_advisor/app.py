@@ -178,6 +178,7 @@ class MainWindow(QMainWindow):
         )
         self.steam.signals.state.connect(self.on_steam_state)
         self.steam.signals.status.connect(self.on_steam_status)
+        self.steam.signals.unavailable.connect(self.on_steam_unavailable)
         self.pool = QThreadPool.globalInstance()
 
         self.capture_busy = False
@@ -289,8 +290,10 @@ class MainWindow(QMainWindow):
         self.timer.setInterval(self.settings.ui_interval_ms)
 
         self.clear_state()
+        # The HTTP server also serves Steam's PAC URL; browser events remain
+        # isolated by on_hook_state/on_hook_status when Steam is selected.
+        self.hook.start()
         if self.settings.input_source == "browser":
-            self.hook.start()
             self.title_bar.set_status("等待连接", "idle")
             self.bottom_bar.set_status_info("网页 Hook 监听中", "打开或刷新雀魂网页即可自动捕获实时牌局")
         else:
@@ -507,7 +510,7 @@ class MainWindow(QMainWindow):
         self.clear_state()
         self.bottom_bar.btn_toggle.setText("开始识别")
         if source == "steam":
-            self.hook.stop()
+            self.hook.start()
             self.bottom_bar.set_status_info(
                 "Steam 实时协议模式",
                 "点击【开始识别】启动毫秒级协议直连；首次使用可在【桌】安装本地证书",
@@ -518,6 +521,7 @@ class MainWindow(QMainWindow):
             self.bottom_bar.set_status_info("浏览器模式", "刷新雀魂网页以建立网页 Hook 实时连接")
 
     def edit_steam_settings(self) -> None:
+        self.steam.refresh_system_diagnostic()
         dialog = SteamConnectionDialog(self.settings, self.steam.diagnostic_snapshot(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.settings.steam_capture_mode = dialog.mode_combo.currentData()
@@ -547,6 +551,7 @@ class MainWindow(QMainWindow):
             self.bottom_bar.set_status_info("Steam 捕获启动失败", self.steam.last_error or "请检查【桌】-> Steam 实时连接设置")
 
     def show_steam_diagnostic(self) -> None:
+        self.steam.refresh_system_diagnostic()
         snap = self.steam.diagnostic_snapshot()
         procs = snap.get("detected_processes") or []
         proc_desc = (
@@ -950,8 +955,9 @@ class MainWindow(QMainWindow):
             self.clear_state()
 
         if self.settings.input_source == "steam":
-            if not self.steam.running:
-                self.steam.start()
+            if not self.steam.running and not self.steam.start():
+                self.on_steam_unavailable(self.steam.last_error or "Steam 捕获启动失败")
+                return
             self._hook_active = self.steam.live_ready
             self._begin_realtime("Steam 实时协议监听中 · 牌局变化毫秒级自动请求 Jev")
         else:
@@ -990,6 +996,13 @@ class MainWindow(QMainWindow):
         else:
             self.bottom_bar.set_status_info(message, "网页 Hook 实时诊断")
 
+    def on_steam_unavailable(self, message: str) -> None:
+        if self.settings.input_source != "steam":
+            return
+        self._hook_active = False
+        self._connection_revision += 1
+        self.on_capture_failure(message)
+
     def on_steam_status(self, message: str) -> None:
         if self.settings.input_source != "steam":
             return
@@ -1000,7 +1013,8 @@ class MainWindow(QMainWindow):
         if message == "connected" or "协议已就绪" in message or "已捕获" in message:
             self._hook_active = True
         elif message == "disconnected":
-            self._hook_active = False
+            self.on_steam_unavailable("Steam 实时连接已断开 · 等待重新同步牌局")
+            return
         if not self.running:
             self.title_bar.set_status("Steam 就绪", "active")
             self.bottom_bar.set_status_info(message, "Steam 实时协议通道已准备")

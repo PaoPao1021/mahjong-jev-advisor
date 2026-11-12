@@ -329,10 +329,12 @@ class ReadOnlyLiqiAddon:
         on_frame: Callable[[str, bytes, str, str], None],
         on_schema: Callable[[dict[str, Any]], None] | None = None,
         on_socket_change: Callable[[int, str], None] | None = None,
+        on_socket_end: Callable[[str], None] | None = None,
     ):
         self._on_frame = on_frame
         self._on_schema = on_schema
         self._on_socket_change = on_socket_change
+        self._on_socket_end = on_socket_end
         self.active_sockets: dict[str, str] = {}
         self.confirmed_liqi_sockets: set[str] = set()
         self.last_host: str = ""
@@ -414,6 +416,8 @@ class ReadOnlyLiqiAddon:
             conn_id = str(getattr(flow, "id", ""))
             self.active_sockets.pop(conn_id, None)
             self.confirmed_liqi_sockets.discard(conn_id)
+            if self._on_socket_end is not None:
+                self._on_socket_end(conn_id)
             if self._on_socket_change is not None:
                 self._on_socket_change(len(self.active_sockets), self.last_host)
         except Exception:
@@ -424,6 +428,7 @@ class SteamCaptureSignals(QObject):
     state = Signal(object)
     status = Signal(str)
     diagnostic = Signal(object)
+    unavailable = Signal(str)
 
 
 class SteamCaptureBridge:
@@ -446,6 +451,16 @@ class SteamCaptureBridge:
         self.signals = SteamCaptureSignals()
         self.protocol = HookProtocol()
         self._lock = threading.Lock()
+        self._diagnostic_lock = threading.Lock()
+        self._diagnostic_checked_at = 0.0
+        self._diagnostic_refreshing = False
+        self._system_diagnostic: dict[str, Any] = {
+            "cert_installed": False,
+            "cert_path": str(mitm_cert_path(self.confdir)),
+            "detected_processes": [],
+        }
+        self._live_ready = False
+        self._state_connection = ""
 
         self.running = False
         self.active_mode_spec = ""
@@ -470,7 +485,7 @@ class SteamCaptureBridge:
 
     @property
     def live_ready(self) -> bool:
-        return self.states_seen > 0
+        return self._live_ready
 
     def _emit_stage(self, stage: str, message: str) -> None:
         if stage != self._last_stage:
@@ -478,7 +493,34 @@ class SteamCaptureBridge:
             self.signals.status.emit(message)
         self.signals.diagnostic.emit(self.diagnostic_snapshot())
 
+    def refresh_system_diagnostic(self) -> None:
+        """Refresh slow OS probes off the proxy/UI threads, at most every 30 seconds."""
+        with self._diagnostic_lock:
+            if self._diagnostic_refreshing or (
+                self._diagnostic_checked_at and time.monotonic() - self._diagnostic_checked_at < 30
+            ):
+                return
+            self._diagnostic_refreshing = True
+
+        def refresh() -> None:
+            try:
+                snapshot = {
+                    "cert_installed": is_mitm_cert_installed(self.confdir),
+                    "cert_path": str(mitm_cert_path(self.confdir)),
+                    "detected_processes": detect_steam_game_processes(),
+                }
+                with self._diagnostic_lock:
+                    self._system_diagnostic = snapshot
+            finally:
+                with self._diagnostic_lock:
+                    self._diagnostic_checked_at = time.monotonic()
+                    self._diagnostic_refreshing = False
+
+        threading.Thread(target=refresh, daemon=True, name="steam-system-diagnostic").start()
+
     def diagnostic_snapshot(self) -> dict[str, Any]:
+        with self._diagnostic_lock:
+            system_diagnostic = dict(self._system_diagnostic)
         return {
             "running": self.running,
             "mode": self.mode,
@@ -496,9 +538,7 @@ class SteamCaptureBridge:
             "last_message_name": self.protocol.last_message_name,
             "last_action_name": self.protocol.last_action_name,
             "own_seat": self.protocol.builder.own_seat,
-            "cert_installed": is_mitm_cert_installed(self.confdir),
-            "cert_path": str(mitm_cert_path(self.confdir)),
-            "detected_processes": detect_steam_game_processes(),
+            **system_diagnostic,
         }
 
     def configure(
@@ -545,6 +585,8 @@ class SteamCaptureBridge:
                 state = self.protocol.feed(direction, frame, connection)
                 if state is not None:
                     self.states_seen += 1
+                    self._live_ready = True
+                    self._state_connection = connection
                     self._last_stage = "state-ready"
             if first_frame and state is None:
                 self._emit_stage("frames-ready", "Steam 实时通道已捕获雀魂数据帧 · 等待开局状态")
@@ -567,13 +609,29 @@ class SteamCaptureBridge:
         self.ws_connections = count
         if host:
             self.last_host = host
-        if count > 0 and self.states_seen <= 0:
+        if count == 0:
+            self._invalidate_state("Steam 实时连接已断开 · 等待重新同步牌局")
+        if count > 0 and not self.live_ready:
             self._emit_stage(
                 "socket-ready",
                 f"已截获 Steam 雀魂连接（{host or 'WebSocket'}）· 等待牌局数据",
             )
         else:
             self.signals.diagnostic.emit(self.diagnostic_snapshot())
+
+    def _on_socket_end(self, connection: str) -> None:
+        # The lobby WebSocket may stay open after the actual game disconnects.
+        if connection and connection == self._state_connection:
+            self._invalidate_state("Steam 对局连接已断开 · 等待重新同步牌局")
+
+    def _invalidate_state(self, message: str) -> None:
+        with self._lock:
+            self._live_ready = False
+            self._state_connection = ""
+            self.last_seen = 0.0
+            # Never combine a new connection's actions with the previous hand.
+            self.protocol = HookProtocol()
+        self.signals.unavailable.emit(message)
 
     def _build_proxy_mode_spec(self) -> str:
         if self.upstream_proxy:
@@ -593,6 +651,7 @@ class SteamCaptureBridge:
         if self.running:
             return True
 
+        self.refresh_system_diagnostic()
         try:
             ensure_mitm_ca_generated(self.confdir)
         except Exception as error:
@@ -619,6 +678,7 @@ class SteamCaptureBridge:
                     on_frame=self.ingest_frame,
                     on_schema=self.ingest_schema,
                     on_socket_change=self._on_socket_change,
+                    on_socket_end=self._on_socket_end,
                 )
                 self._addon = addon
                 self._master = master
@@ -639,44 +699,41 @@ class SteamCaptureBridge:
                 )
                 self.fallback_active = False
 
-                run_task = asyncio.create_task(master.run())
+                async def start_mode(spec: str) -> None:
+                    # Configure before Master.run(): Proxyserver.running is only
+                    # a lifecycle flag, not evidence that any listener started.
+                    opts.update(confdir=str(self.confdir), mode=[spec])
+                    await asyncio.wait_for(ps.setup_servers(), timeout=2.0)
+                    instance = ps.servers[spec]
+                    if not instance.is_running or instance.last_exception is not None:
+                        raise RuntimeError(str(instance.last_exception or f"无法启动监听模式 {spec}"))
+
                 try:
-                    opts.update(
-                        confdir=str(self.confdir),
-                        ssl_insecure=True,
-                        mode=desired_modes,
-                    )
-                    await asyncio.sleep(0.25)
-                    # Verify that the server actually started; if OS process capture
-                    # could not start (e.g. missing elevation/network extension),
-                    # fall back to local proxy mode automatically.
-                    if not ps.is_running or (self.mode == "proxy" and not ps.listen_addrs()):
-                        raise RuntimeError(f"无法启动监听模式 {desired_modes[0]}")
+                    await start_mode(desired_modes[0])
                     self.active_mode_spec = desired_modes[0]
-                    self.running = True
                     start_result["ok"] = True
                 except Exception as primary_error:
                     if self.mode == "process":
                         try:
-                            opts.update(mode=[proxy_spec])
-                            await asyncio.sleep(0.25)
-                            if ps.is_running and ps.listen_addrs():
-                                self.fallback_active = True
-                                self.active_mode_spec = proxy_spec
-                                self.last_error = f"进程直连未就绪（{primary_error}），已自动回退本地代理"
-                                self.running = True
-                                start_result["ok"] = True
-                            else:
-                                start_result["error"] = str(primary_error)
+                            await start_mode(proxy_spec)
+                            self.fallback_active = True
+                            self.active_mode_spec = proxy_spec
+                            self.last_error = f"进程直连未就绪（{primary_error}），已自动回退本地代理"
+                            start_result["ok"] = True
                         except Exception as fallback_error:
                             start_result["error"] = f"{primary_error}; fallback: {fallback_error}"
                     else:
                         start_result["error"] = str(primary_error)
 
+                self.running = start_result["ok"]
                 ready_event.set()
-                if not start_result["ok"]:
-                    master.shutdown()
-                await run_task
+                if self.running:
+                    try:
+                        await master.run()
+                    finally:
+                        await ps.servers.update([])
+                else:
+                    await ps.servers.update([])
 
             try:
                 loop.run_until_complete(_runner())
@@ -685,6 +742,7 @@ class SteamCaptureBridge:
                 ready_event.set()
             finally:
                 self.running = False
+                self._invalidate_state("Steam 捕获引擎已停止 · 等待重新连接")
                 try:
                     loop.close()
                 except Exception:
@@ -740,6 +798,7 @@ class SteamCaptureBridge:
         self._addon = None
         self.running = False
         self.ws_connections = 0
+        self._invalidate_state("Steam 捕获引擎已停止 · 等待重新连接")
 
 
 def run_steam_capture_worker(argv: list[str] | None = None) -> int:

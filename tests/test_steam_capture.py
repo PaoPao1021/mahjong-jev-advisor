@@ -6,6 +6,8 @@ import time
 import urllib.request
 from types import SimpleNamespace
 
+import pytest
+
 from PySide6.QtCore import Qt
 
 from mahjong_jev_advisor.hook import (
@@ -254,3 +256,111 @@ def test_steam_capture_bridge_live_proxy_lifecycle_and_frame_ingestion():
     finally:
         bridge.stop()
         assert bridge.running is False
+
+
+@pytest.mark.parametrize("partially_started", [False, True])
+def test_process_capture_failure_falls_back_to_verified_proxy(tmp_path, monkeypatch, partially_started):
+    async def denied(instance):
+        raise PermissionError("redirector permission denied")
+
+    monkeypatch.setattr("mitmproxy.proxy.mode_servers.LocalRedirectorInstance._start", denied)
+    if partially_started:
+        monkeypatch.setattr("mitmproxy.proxy.mode_servers.LocalRedirectorInstance.is_running", property(lambda self: True))
+    bridge = SteamCaptureBridge(mode="process", proxy_port=_free_port(), confdir=tmp_path)
+    try:
+        assert bridge.start()
+        assert bridge.fallback_active
+        assert bridge.active_mode_spec.startswith("regular@")
+        proxy = bridge._master.addons.get("proxyserver")
+        assert all(server.is_running for server in proxy.servers)
+        assert bridge._master.options.ssl_insecure is False
+    finally:
+        bridge.stop()
+
+
+def test_proxy_failure_is_not_reported_as_running(tmp_path):
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        bridge = SteamCaptureBridge(mode="proxy", proxy_port=occupied.getsockname()[1], confdir=tmp_path)
+        try:
+            assert not bridge.start()
+            assert not bridge.running
+            assert bridge.last_error
+        finally:
+            bridge.stop()
+
+
+def test_slow_system_diagnostics_do_not_block_frame_delivery(tmp_path, monkeypatch):
+    import threading
+    from mahjong_jev_advisor.state import GameState
+
+    entered = threading.Event()
+    release = threading.Event()
+    def slow_certificate_check(confdir):
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr("mahjong_jev_advisor.steam_capture.is_mitm_cert_installed", slow_certificate_check)
+    monkeypatch.setattr("mahjong_jev_advisor.steam_capture.detect_steam_game_processes", lambda: [])
+    bridge = SteamCaptureBridge(confdir=tmp_path)
+    state = GameState.from_dict({"hand": "123m456p789s123z55m"})
+    monkeypatch.setattr(bridge.protocol, "feed", lambda *args: state)
+    bridge.refresh_system_diagnostic()
+    try:
+        assert entered.wait(2)
+        # The OS probe remains blocked while the frame and snapshot complete.
+        assert bridge.ingest_frame("receive", b"frame", "game") == state
+        assert bridge.diagnostic_snapshot()["states_seen"] == 1
+    finally:
+        release.set()
+
+
+def test_disconnect_invalidates_ready_state_and_protocol(tmp_path):
+    bridge = SteamCaptureBridge(confdir=tmp_path)
+    bridge._live_ready = True
+    bridge.protocol.builder.hand = ["1m"]
+    messages = []
+    bridge.signals.unavailable.connect(messages.append, Qt.ConnectionType.DirectConnection)
+    bridge._on_socket_change(0, "game.maj-soul.com")
+    assert messages
+    assert not bridge.live_ready
+    assert not bridge.protocol.builder.hand
+    assert bridge.last_seen == 0
+
+
+def test_game_disconnect_invalidates_state_while_lobby_stays_open(tmp_path, monkeypatch):
+    from mahjong_jev_advisor.state import GameState
+    bridge = SteamCaptureBridge(confdir=tmp_path)
+    state = GameState.from_dict({"hand": "123m456p789s123z55m"})
+    monkeypatch.setattr(bridge.protocol, "feed", lambda *args: state)
+    addon = ReadOnlyLiqiAddon(
+        bridge.ingest_frame, on_socket_change=bridge._on_socket_change,
+        on_socket_end=bridge._on_socket_end,
+    )
+    for connection in ("lobby", "game"):
+        addon.websocket_start(SimpleNamespace(id=connection, request=SimpleNamespace(pretty_host="game.maj-soul.com")))
+    bridge.ingest_frame("receive", b"frame", "game")
+    assert bridge.live_ready
+    addon.websocket_end(SimpleNamespace(id="game"))
+    assert bridge.ws_connections == 1
+    assert not bridge.live_ready
+
+
+def test_start_waits_for_listener_instead_of_fixed_delay(tmp_path, monkeypatch):
+    import asyncio
+    from mitmproxy.proxy.mode_servers import RegularInstance
+    original_start = RegularInstance._start
+
+    async def delayed_start(instance):
+        await asyncio.sleep(0.4)
+        await original_start(instance)
+
+    monkeypatch.setattr(RegularInstance, "_start", delayed_start)
+    bridge = SteamCaptureBridge(mode="proxy", proxy_port=_free_port(), confdir=tmp_path)
+    try:
+        assert bridge.start()
+        assert bridge._master.addons.get("proxyserver").listen_addrs()
+    finally:
+        bridge.stop()

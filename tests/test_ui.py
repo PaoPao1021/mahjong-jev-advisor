@@ -516,7 +516,7 @@ def test_manual_sanma_riichi_uses_actual_seat(qapp):
 def test_input_switch_isolates_browser_and_steam_protocol_events(qapp, monkeypatch):
     window = MainWindow()
     try:
-        monkeypatch.setattr(window.steam, "start", lambda: None)
+        monkeypatch.setattr(window.steam, "start", lambda: True)
         monkeypatch.setattr(window.steam, "stop", lambda: None)
         window.set_input_source("steam")
         assert window.settings.input_source == "steam"
@@ -544,7 +544,7 @@ def test_steam_protocol_status_and_state_lifecycle(qapp, monkeypatch):
     window = MainWindow()
     try:
         assert not window.hook.connected and not window.running
-        monkeypatch.setattr(window.steam, "start", lambda: None)
+        monkeypatch.setattr(window.steam, "start", lambda: True)
         monkeypatch.setattr(window.steam, "stop", lambda: None)
         window.toggle_recognition()
         assert window.running
@@ -571,7 +571,7 @@ def test_steam_supports_both_four_player_and_sanma_realtime_states(qapp, monkeyp
     from mahjong_jev_advisor.state import GameState
     Settings(input_source="steam").save()
     window = MainWindow()
-    monkeypatch.setattr(window.steam, "start", lambda: None)
+    monkeypatch.setattr(window.steam, "start", lambda: True)
     monkeypatch.setattr(window.steam, "stop", lambda: None)
     state = GameState.from_dict({"player_count": 3, "hand": "19m123456p123s114z"})
     dialog = SimpleNamespace(state=state, learn_and_resume=SimpleNamespace(isChecked=lambda: True),
@@ -743,7 +743,7 @@ def test_repeated_state_preserves_selected_tile_and_highlight(qapp, source, simu
     from mahjong_jev_advisor.rules import discard_candidate
 
     window = MainWindow()
-    monkeypatch.setattr(window.steam, "start", lambda: None)
+    monkeypatch.setattr(window.steam, "start", lambda: True)
     monkeypatch.setattr(window.steam, "stop", lambda: None)
     window.settings.input_source = source
     state = _demo_reference_state()
@@ -803,7 +803,7 @@ def test_invalidating_state_clears_simulation_and_highlights(qapp, reason, monke
     from dataclasses import replace
 
     window = MainWindow()
-    monkeypatch.setattr(window.steam, "start", lambda: None)
+    monkeypatch.setattr(window.steam, "start", lambda: True)
     monkeypatch.setattr(window.steam, "stop", lambda: None)
     try:
         window._load_initial_preview()
@@ -1219,7 +1219,7 @@ def test_comparison_reuses_window_refreshes_and_marks_stale(qapp):
 def test_comparison_dialog_works_seamlessly_during_steam_realtime_protocol_stream(qapp, monkeypatch):
     from dataclasses import replace
     window = MainWindow()
-    monkeypatch.setattr(window.steam, "start", lambda: None)
+    monkeypatch.setattr(window.steam, "start", lambda: True)
     monkeypatch.setattr(window.steam, "stop", lambda: None)
     window.settings.input_source = "steam"
     window._load_initial_preview()
@@ -1252,3 +1252,50 @@ def test_compact_action_bar_tab_order_and_bounds(qapp):
                 assert button.nextInFocusChain() is buttons[index + 1]
     finally:
         bar.close()
+
+
+def test_steam_edition_serves_pac(qapp, monkeypatch):
+    import urllib.request
+    monkeypatch.setenv("MAHJONG_ADVISOR_EDITION", "steam")
+    window = MainWindow()
+    try:
+        assert window.hook._server is not None
+        with urllib.request.urlopen(f"http://127.0.0.1:{window.hook.port}/proxy.pac", timeout=2) as response:
+            assert f"PROXY 127.0.0.1:{window.settings.steam_proxy_port}" in response.read().decode()
+    finally:
+        window.close()
+
+
+def test_steam_disconnect_rejects_inflight_advice_and_simulation(qapp, monkeypatch):
+    from mahjong_jev_advisor.state import Advice, Candidate
+    monkeypatch.setenv("MAHJONG_ADVISOR_EDITION", "steam")
+    window = MainWindow()
+    try:
+        state = _demo_reference_state()
+        window.last_state = state
+        window._render_state(state)
+        window.pending_identity = state.identity()
+        window._active_connection_revision = window._connection_revision
+        window.steam._on_socket_change(0, "game.maj-soul.com")
+        qapp.processEvents()
+        assert window.pending_identity is None
+        assert not window._comparison_state_available
+        candidate = Candidate("discard", "1p", "打 1p", "旧结果")
+        window.on_advice((state.identity(), Advice(candidate), state))
+        assert window._current_chosen is None
+        window.on_hand_tile_clicked(state.hand[0])
+        assert window._current_chosen is None
+    finally:
+        window.close()
+
+
+def test_steam_start_failure_does_not_enable_monitoring(qapp, monkeypatch):
+    monkeypatch.setenv("MAHJONG_ADVISOR_EDITION", "steam")
+    window = MainWindow()
+    try:
+        monkeypatch.setattr(window.steam, "start", lambda: False)
+        window.toggle_recognition()
+        assert not window.running
+        assert not window._comparison_state_available
+    finally:
+        window.close()
