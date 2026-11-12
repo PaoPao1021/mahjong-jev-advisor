@@ -12,7 +12,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontDatabase, QLinearGradient, QPainter, QPainterPath, QPen,
 )
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
 from .tiles import normal, valid
 
@@ -33,17 +33,28 @@ COLOR_GLOW = QColor(16, 185, 129)       # Emerald neon glow
 COLOR_GLOW_BG = QColor(16, 185, 129, 70)
 
 
+_FONT_FAMILY_CACHE: str | None = None
+
+
 def _tile_font_family() -> str:
-    """Choose a font that contains the CJK glyphs printed on tile faces."""
+    """Choose a font that contains the CJK glyphs printed on tile faces.
+
+    Cached: QFontDatabase.families() enumerates every installed font and is
+    far too expensive to run inside a paint method.
+    """
+    global _FONT_FAMILY_CACHE
+    if _FONT_FAMILY_CACHE is not None:
+        return _FONT_FAMILY_CACHE
     installed = set(QFontDatabase.families())
     for family in (
         "Microsoft YaHei UI", "Microsoft YaHei", "SimHei",
         "Noto Sans CJK SC", "Noto Sans CJK JP", "Arial Unicode MS",
     ):
         if family in installed:
+            _FONT_FAMILY_CACHE = family
             return family
-    from PySide6.QtWidgets import QApplication
-    return QApplication.font().family()
+    _FONT_FAMILY_CACHE = QApplication.font().family()
+    return _FONT_FAMILY_CACHE
 
 
 def draw_tile_base(painter: QPainter, rect: QRectF, glowing: bool = False) -> None:

@@ -20,8 +20,26 @@ from PySide6.QtWidgets import (
     QScrollArea, QSizePolicy, QToolTip, QVBoxLayout, QWidget,
 )
 
-from .tiles import normal
 from .ui_tiles import CompactTileBadge, MahjongTileWidget
+from .tiles import valid
+
+# Semantic colors for the banded danger label (safe green through severe red).
+DANGER_PILL_STYLES: dict[str, str] = {
+    "calm": "background-color: rgba(71, 85, 105, 0.35); color: #a7f3d0; border: 1px solid rgba(100, 116, 139, 0.5);",
+    "safe": "background-color: rgba(6, 78, 59, 0.55); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.5);",
+    "low": "background-color: rgba(12, 74, 110, 0.45); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.45);",
+    "watch": "background-color: rgba(120, 53, 15, 0.45); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.5);",
+    "high": "background-color: rgba(124, 45, 18, 0.5); color: #fdba74; border: 1px solid rgba(249, 115, 22, 0.55);",
+    "severe": "background-color: rgba(127, 29, 29, 0.55); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.6);",
+    "unknown": "background-color: rgba(71, 85, 105, 0.35); color: #94a3b8; border: 1px solid rgba(100, 116, 139, 0.5);",
+}
+
+DANGER_BAND_TOOLTIP = (
+    "相对危险档位（启发式，非放铳概率）：\n"
+    "安全：现物或四枚可见 · 较安全：筋 1-9 或字牌三枚见\n"
+    "注意：双筋中张或字牌两枚见 · 危险：半筋中张\n"
+    "高危：无筋中张或无筋宝牌"
+)
 
 
 class DragBar(QWidget):
@@ -128,23 +146,17 @@ class HUDTitleBar(DragBar):
         layout.addWidget(self.btn_close)
 
     def set_status(self, text: str, state: str = "active") -> None:
-        """state: 'active' (green), 'warning' (amber), 'idle' (gray/blue)"""
+        """state: 'active' (green), 'warning' (amber), 'idle' (gray)"""
+        palettes = {
+            "active": ("#34d399", "rgba(16, 185, 129, 0.16)", "rgba(16, 185, 129, 0.45)"),
+            "warning": ("#fbbf24", "rgba(245, 158, 11, 0.16)", "rgba(245, 158, 11, 0.45)"),
+        }
+        color, bg, border = palettes.get(state, ("#94a3b8", "rgba(71, 85, 105, 0.22)", "rgba(100, 116, 139, 0.35)"))
         self.status_pill.setText(text)
-        if state == "active":
-            self.status_pill.setStyleSheet(
-                "color: #34d399; background: rgba(16, 185, 129, 0.16); border: 1px solid rgba(16, 185, 129, 0.45); "
-                "border-radius: 9px; padding: 2px 9px; font-weight: 700; font-size: 11px;"
-            )
-        elif state == "warning":
-            self.status_pill.setStyleSheet(
-                "color: #fbbf24; background: rgba(245, 158, 11, 0.16); border: 1px solid rgba(245, 158, 11, 0.45); "
-                "border-radius: 9px; padding: 2px 9px; font-weight: 700; font-size: 11px;"
-            )
-        else:
-            self.status_pill.setStyleSheet(
-                "color: #94a3b8; background: rgba(71, 85, 105, 0.22); border: 1px solid rgba(100, 116, 139, 0.35); "
-                "border-radius: 9px; padding: 2px 9px; font-weight: 700; font-size: 11px;"
-            )
+        self.status_pill.setStyleSheet(
+            f"color: {color}; background: {bg}; border: 1px solid {border}; "
+            "border-radius: 9px; padding: 2px 9px; font-weight: 700; font-size: 11px;"
+        )
 
 
 class RoundInfoBar(QWidget):
@@ -182,25 +194,25 @@ class RoundInfoBar(QWidget):
 
     def set_round_info(
         self,
-        round_wind: str = "E",
-        round_num: int | None = 1,
-        remaining_tiles: int | None = 29,
-        seat_desc: str = "3北",
+        round_wind: str = "?",
+        round_num: int | None = None,
+        remaining_tiles: int | None = None,
+        seat_desc: str = "",
         honba: int = 0,
         sticks: int = 0,
         dora_indicator: str = "",
     ) -> None:
-        winds = {"E": "东", "S": "南", "W": "西", "N": "北", "?": "东"}
-        wind_zh = winds.get(round_wind, "东")
-        num_zh = f"{round_num}" if round_num is not None else "1"
-        round_str = f"{wind_zh}{num_zh}局"
+        winds = {"E": "东", "S": "南", "W": "西", "N": "北"}
+        wind_zh = winds.get(round_wind, "?")
+        num_zh = str(round_num) if round_num is not None else "?"
+        round_str = "局况未知" if wind_zh == "?" and round_num is None else f"{wind_zh}{num_zh}局"
 
         rem_str = f"余 {remaining_tiles}" if remaining_tiles is not None else "对局中"
-        seat_str = seat_desc or (f"本场 {honba}" if honba > 0 else "")
-
         parts = [round_str, rem_str]
-        if seat_str:
-            parts.append(seat_str)
+        if seat_desc:
+            parts.append(seat_desc)
+        if honba > 0:
+            parts.append(f"{honba}本场")
         if sticks > 0:
             parts.append(f"供托{sticks}")
 
@@ -255,6 +267,13 @@ class PlayerRiverRow(QWidget):
 
         self._all_tiles: list[str] = []
 
+    def set_wind(self, text: str, highlighted: bool) -> None:
+        self.wind_label.setText(text)
+        if highlighted:
+            self.wind_label.setStyleSheet("color: #fde047; font-weight: 800; font-size: 13px;")
+        else:
+            self.wind_label.setStyleSheet("color: #94a3b8; font-weight: 700; font-size: 12px;")
+
     def update_row(
         self,
         score: int | None,
@@ -264,7 +283,7 @@ class PlayerRiverRow(QWidget):
     ) -> None:
         self.score_label.setText(f"{score:,}" if score is not None else "—")
         self.riichi_badge.setVisible(bool(is_riichi))
-        self.meld_label.setText(melds_desc if melds_desc else ("副露" if melds_desc else "门清"))
+        self.meld_label.setText(melds_desc or "门清")
 
         # Clear river widgets
         while self.river_layout.count() > 1:
@@ -313,20 +332,27 @@ class FourPlayersRiverWidget(QFrame):
         rivers: tuple[tuple[str, ...], ...] | list[list[str]],
         melds: tuple[tuple[str, ...], ...] | list[list[str]],
         my_seat: int = 0,
+        seat_wind: str = "?",
     ) -> None:
+        # Hook indices are absolute, while screen/manual indices may be relative.
+        # Anchor the rotation to the observed own wind, not the round number.
+        count = len(scores)
+        wind_names = {"E": "东", "S": "南", "W": "西", "N": "北"}
+        order = "ESWN"
+        own_wind_index = order.index(seat_wind) if seat_wind in order[:count] else None
         for i in range(4):
-            self.rows[i].setVisible(i < len(scores))
-            score = scores[i] if i < len(scores) else None
+            self.rows[i].setVisible(i < count)
+            score = scores[i] if i < count else None
             is_riichi = bool(riichi[i]) if i < len(riichi) and riichi[i] is not None else False
             r_tiles = rivers[i] if i < len(rivers) else []
             m_list = melds[i] if i < len(melds) else []
-            meld_text = f"副露×{len(m_list)}" if m_list else "门清"
-            if i == my_seat:
-                # Highlight current player wind with luminous gold
-                self.rows[i].wind_label.setStyleSheet("color: #fde047; font-weight: 800; font-size: 13px;")
+            # GameState exposes flattened meld tiles, not group boundaries.
+            meld_text = f"副露 {len(m_list)} 张" if m_list else "门清"
+            if i < count:
+                wind = order[(own_wind_index + i - my_seat) % count] if own_wind_index is not None else "?"
+                self.rows[i].set_wind(wind_names.get(wind, "?"), i == my_seat)
             else:
-                self.rows[i].wind_label.setStyleSheet("color: #94a3b8; font-weight: 700; font-size: 12px;")
-
+                self.rows[i].set_wind("—", False)
             self.rows[i].update_row(score, is_riichi, meld_text, r_tiles)
 
 
@@ -423,14 +449,12 @@ class HandWidget(QWidget):
         hand_tiles = tile_list[:-1] if has_draw else tile_list
         draw_tile = tile_list[-1] if has_draw else ""
 
-        norm_highlight = normal(highlight_tile) if highlight_tile else None
-
         # Populate hand slots
         for i, slot in enumerate(self.hand_slots):
             if i < len(hand_tiles):
                 t = hand_tiles[i]
                 slot.set_tile(t)
-                is_glow = norm_highlight is not None and normal(t) == norm_highlight
+                is_glow = highlight_tile is not None and t == highlight_tile
                 slot.set_glowing(is_glow)
                 slot.show()
             else:
@@ -441,7 +465,7 @@ class HandWidget(QWidget):
         # Populate drawn tile slot
         if draw_tile:
             self.draw_slot.set_tile(draw_tile)
-            is_glow = norm_highlight is not None and normal(draw_tile) == norm_highlight
+            is_glow = highlight_tile is not None and draw_tile == highlight_tile
             self.draw_slot.set_glowing(is_glow)
             self.draw_slot.show()
         else:
@@ -463,6 +487,7 @@ class ProbabilityBarItem(QWidget):
     ):
         super().__init__(parent)
         self.label = label
+        self.setToolTip(label)
         self.percent = max(0, min(100, percent))
         self.is_top = is_top
         self.bar_color = bar_color or (QColor("#10b981") if is_top else QColor("#8b5cf6"))
@@ -482,12 +507,15 @@ class ProbabilityBarItem(QWidget):
         font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
         painter.setFont(font)
         painter.setPen(QColor("#34d399") if self.is_top else QColor("#cbd5e1"))
-        label_rect = QRectF(2, 0, 36, h)
-        painter.drawText(label_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.label)
+        metrics = painter.fontMetrics()
+        label_width = min(max(36, metrics.horizontalAdvance(self.label) + 4), max(36, int(w * 0.4)))
+        label_rect = QRectF(2, 0, label_width, h)
+        label = metrics.elidedText(self.label, Qt.TextElideMode.ElideRight, label_width)
+        painter.drawText(label_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
 
         # Bar track: sleek dark frosted channel
-        bar_x = 42.0
-        bar_w = w - bar_x - 42.0
+        bar_x = float(label_width + 8)
+        bar_w = max(0.0, w - bar_x - 42.0)
         bar_rect = QRectF(bar_x, h * 0.26, bar_w, h * 0.48)
         painter.setPen(QPen(QColor(42, 54, 80, 160), 0.8))
         painter.setBrush(QBrush(QColor(18, 24, 38, 200)))
@@ -573,15 +601,15 @@ class DecisionHeroCard(QFrame):
         self.bars_layout.setSpacing(2)
         layout.addWidget(self.bars_container)
 
-        # Data Pills: 【防守倾向 28/100】 【风险分 1.03】 【摸切 6】 【副露 2】
+        # Data Pills: 【立直 2 家】 【危险 注意】 【摸切 6】 【副露 2】
         self.pills_row = QHBoxLayout()
         self.pills_row.setSpacing(4)
 
-        self.pill_fold = QLabel("防守倾向 —")
+        self.pill_fold = QLabel("立直状态未知")
         self.pill_fold.setObjectName("dataPill")
         self.pills_row.addWidget(self.pill_fold)
 
-        self.pill_danger = QLabel("风险分 1.03")
+        self.pill_danger = QLabel("危险 —")
         self.pill_danger.setObjectName("dataPill")
         self.pills_row.addWidget(self.pill_danger)
 
@@ -606,7 +634,7 @@ class DecisionHeroCard(QFrame):
         self.stats_line_1.setObjectName("heroSubText")
         layout.addWidget(self.stats_line_1)
 
-        self.stats_line_2 = QLabel("风险 放铳风险 1.03 (confidence 0.38)")
+        self.stats_line_2 = QLabel("危险档位为启发式相对评估")
         self.stats_line_2.setObjectName("heroSubText")
         layout.addWidget(self.stats_line_2)
 
@@ -636,8 +664,9 @@ class DecisionHeroCard(QFrame):
         shanten_num: int | None = 2,
         confidence: float | None = 0.78,
         probabilities: list[tuple[str, int, bool]] | None = None,
-        fold_rate: int = 28,
-        danger_score: float = 1.03,
+        danger_label: str = "—",
+        danger_key: str = "unknown",
+        threat_note: str = "",
         draw_info: str = "摸切",
         melds_count: int = 0,
         alternatives: list[str] | None = None,
@@ -645,7 +674,10 @@ class DecisionHeroCard(QFrame):
         raw_detail: str = "",
         yaku_badge: str = "",
         probability_label: str = "Jev 选择概率",
+        decision_available: bool | None = None,
     ) -> None:
+        if decision_available is None:
+            decision_available = bool(rec_tile)
         self.rec_tile = rec_tile
         self.action_badge.setText(f"AI {action_name}")
         self.hero_tile.set_tile(rec_tile, glowing=bool(rec_tile))
@@ -662,12 +694,12 @@ class DecisionHeroCard(QFrame):
                 self.shanten_label.setText(f"{shanten_num}向听")
                 self.shanten_label.setStyleSheet("color: #34d399; font-size: 18px; font-weight: 900;")
         else:
-            self.shanten_label.setText("等待决策")
+            self.shanten_label.setText("动作建议" if decision_available else "等待决策")
             self.shanten_label.setStyleSheet("color: #94a3b8; font-size: 18px; font-weight: 900;")
 
         conf_str = f"置信 {int(confidence * 100)}%" if confidence is not None else "未提供置信度"
         self.confidence_pill.setText(conf_str)
-        self.confidence_pill.setVisible(bool(rec_tile))
+        self.confidence_pill.setVisible(decision_available)
 
         if raw_detail:
             self.hero_desc.setText(raw_detail)
@@ -685,11 +717,14 @@ class DecisionHeroCard(QFrame):
                 bar = ProbabilityBarItem(label, pct, is_top=is_top)
                 self.bars_layout.addWidget(bar)
 
-        # Data pills
-        self.pill_fold.setText(f"防守倾向 {fold_rate}/100")
-        self.pill_danger.setText(f"风险分 {danger_score:.2f}")
+        # Data pills: the fold pill reports the observed threat count; the
+        # danger pill shows a banded label, never a fabricated score.
+        self.pill_fold.setText(threat_note or "立直状态未知")
+        self.pill_danger.setText(f"危险 {danger_label}" if danger_label != "—" else "危险 —")
+        self.pill_danger.setStyleSheet(DANGER_PILL_STYLES.get(danger_key, DANGER_PILL_STYLES["unknown"]))
+        self.pill_danger.setToolTip(DANGER_BAND_TOOLTIP)
         self.pill_draw_status.setText(draw_info)
-        self.pill_melds.setText(f"副露 {melds_count}")
+        self.pill_melds.setText(f"副露 {melds_count} 组")
         for pill in (self.pill_fold, self.pill_danger, self.pill_draw_status, self.pill_melds):
             pill.setVisible(bool(rec_tile))
         if yaku_badge:
@@ -699,15 +734,15 @@ class DecisionHeroCard(QFrame):
             self.pill_yaku.hide()
 
         # Update detailed stats
-        if not rec_tile:
+        if not decision_available:
             self.stats_line_1.setText("等待可用的决策结果")
-            self.stats_line_2.setText("")
+            self.stats_line_2.setText("危险档位为启发式相对评估")
         else:
             selected = next((pct for _, pct, top in probabilities if top), None)
             probability_text = f"{probability_label} {selected / 100:.2f}" if selected is not None else "模型未提供概率"
             confidence_text = f"置信度 {confidence:.2f}" if confidence is not None else "未提供置信度"
             self.stats_line_1.setText(f"{probability_text} · {confidence_text}")
-            self.stats_line_2.setText(f"本地规则相对风险分 {danger_score:.2f}")
+            self.stats_line_2.setText(f"危险「{danger_label}」为启发式相对评估，非放铳概率")
 
         # Alternatives badges
         while self.alt_badges_layout.count() > 0:
@@ -717,8 +752,14 @@ class DecisionHeroCard(QFrame):
 
         if alternatives:
             for alt in alternatives:
-                badge = CompactTileBadge(alt)
-                badge.clicked.connect(self.alternative_clicked.emit)
+                if valid(alt):
+                    badge = CompactTileBadge(alt)
+                    badge.clicked.connect(self.alternative_clicked.emit)
+                else:
+                    badge = QLabel(alt)
+                    badge.setObjectName("heroSubText")
+                    badge.setWordWrap(True)
+                    badge.setToolTip(f"备选动作：{alt}")
                 self.alt_badges_layout.addWidget(badge)
         else:
             empty_lbl = QLabel("无")
@@ -771,6 +812,7 @@ class BottomActionBar(QWidget):
 
         self.btn_ai = QPushButton("AI建议")
         self.btn_ai.setObjectName("hudGhostBtn")
+        self.btn_ai.setToolTip("对当前局面重新请求建议（Ctrl+Enter）")
         self.btn_ai.clicked.connect(self.ai_suggest_clicked.emit)
         btn_row.addWidget(self.btn_ai, 0, 0)
 

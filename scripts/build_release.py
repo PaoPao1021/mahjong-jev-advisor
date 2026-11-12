@@ -58,9 +58,9 @@ def build(edition: str) -> None:
                "--specpath", str(ROOT / "build"), "--paths", str(ROOT / "src"),
                "--add-data", f"{ROOT / 'src/mahjong_jev_advisor/liqi.json'}:mahjong_jev_advisor",
                "--add-data", f"{marker}:mahjong_jev_advisor",
-               "--collect-all", "rapidocr_onnxruntime", "--collect-all", "onnxruntime",
+               "--collect-all", "mitmproxy", "--collect-all", "mitmproxy_rs",
                "--collect-submodules", "mahjong", "--osx-bundle-identifier", f"io.github.paopao1021.mahjong-jev-advisor.{edition}"]
-    for package in ("PySide6", "opencv-python-headless", "numpy", "mss", "rapidocr-onnxruntime", "mahjong", "mahjong-jev-advisor"):
+    for package in ("PySide6", "mitmproxy", "mahjong", "mahjong-jev-advisor"):
         command += ["--copy-metadata", package]
     command.append(str(ROOT / "packaging" / "launcher.py"))
     subprocess.run(command, cwd=ROOT, check=True)

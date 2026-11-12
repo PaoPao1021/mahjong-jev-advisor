@@ -20,13 +20,38 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal
 
 from .state import GameState
-from .tiles import normal
+from .tiles import normal, sort_hand
 
 HOOK_HOST = "127.0.0.1"
 HOOK_PORT = 8765
+DEFAULT_STEAM_PROXY_PORT = 10999
 MAX_BODY = 6 * 1024 * 1024
 EXPECTED_EXTENSION_VERSION = "0.1.3"
 DEFAULT_SCHEMA_PATH = Path(__file__).parent / "liqi.json"
+MAJSOUL_DOMAINS = (
+    "maj-soul.com",
+    "maj-soul.net",
+    "majsoul.com",
+    "mahjongsoul.com",
+    "yo-star.com",
+    "catmjstudio.com",
+)
+
+
+def build_pac_script(proxy_port: int = DEFAULT_STEAM_PROXY_PORT, proxy_host: str = "127.0.0.1") -> str:
+    """Return a PAC script that routes only Mahjong Soul traffic through the local proxy."""
+    conditions = " ||\n        ".join(
+        f' dnsDomainIs(host, "{domain}") || shExpMatch(host, "*.{domain}")'
+        for domain in MAJSOUL_DOMAINS
+    )
+    return (
+        "function FindProxyForURL(url, host) {\n"
+        f"    if ({conditions.lstrip()}) {{\n"
+        f'        return "PROXY {proxy_host}:{int(proxy_port)}; DIRECT";\n'
+        "    }\n"
+        '    return "DIRECT";\n'
+        "}\n"
+    )
 
 
 def decode_action_data(data: bytes) -> bytes:
@@ -244,7 +269,13 @@ class HookStateBuilder:
             self.reset(keep_seat=True)
             self.chang, self.ju = int(action.get("chang", 0)), int(action.get("ju", 0))
             self.honba, self.sticks = int(action.get("ben", 0)), int(action.get("liqibang", 0))
-            self.hand = list(action.get("tiles", []))
+            raw_hand = list(action.get("tiles", []))
+            if len(raw_hand) == 14:
+                self.hand = sort_hand(raw_hand[:13]) + [raw_hand[13]]
+                if self.own_seat is None and 0 <= self.ju < self.player_count:
+                    self.own_seat = self.ju
+            else:
+                self.hand = sort_hand(raw_hand)
             self.doras = list(action.get("doras") or ([action["dora"]] if action.get("dora") else []))
             scores = list(action.get("scores", []))
             if len(scores) == self.player_count:
@@ -264,6 +295,7 @@ class HookStateBuilder:
                 self.last_discard = tile
                 if seat == self.own_seat:
                     self._remove(tile)
+                    self.hand = sort_hand(self.hand)
                 if action.get("isLiqi") or action.get("is_liqi") or action.get("isWliqi") or action.get("is_wliqi"):
                     self.riichi[seat] = True
             self.doras = list(action.get("doras") or self.doras)
@@ -280,23 +312,43 @@ class HookStateBuilder:
                     for tile, count in needed.items():
                         for _ in range(max(0, count)):
                             self._remove(tile)
+                    self.hand = sort_hand(self.hand)
                 self._remove_called_discard()
             self._operations(action.get("operation"))
         elif short == "ActionAnGangAddGang":
             seat, tile = action.get("seat"), action.get("tiles") or action.get("tile")
-            if isinstance(seat, int) and 0 <= seat < self.player_count and isinstance(tile, str):
+            if isinstance(seat, int) and 0 <= seat < self.player_count and isinstance(tile, str) and tile:
                 in_hand = sum(normal(value) == normal(tile) for value in self.hand)
                 # Mahjong Soul uses type=3 for a concealed kan and type=2 for
                 # an added kan. Opponents' concealed tiles are unavailable, so
                 # the action type is required to reconstruct their meld.
                 concealed = action.get("type") == 3 or (seat == self.own_seat and in_hand >= 4)
                 copies = 4 if concealed else 1
-                self.melds[seat].extend([tile] * copies)
                 if concealed:
                     self.meld_groups[seat] += 1
                 if seat == self.own_seat:
+                    removed: list[str] = []
                     for _ in range(copies):
-                        self._remove(tile)
+                        popped = self._remove(tile)
+                        if popped:
+                            removed.append(popped)
+                    while len(removed) < copies:
+                        fill = (tile if tile.startswith("0") and tile not in removed and tile not in self.melds[seat]
+                                else normal(tile))
+                        removed.append(fill)
+                    self.melds[seat].extend(removed)
+                    self.hand = sort_hand(self.hand)
+                else:
+                    base = normal(tile)
+                    if copies == 4:
+                        meld_tiles = ([tile, base, base, base]
+                                      if tile.startswith("0") and tile not in self.melds[seat]
+                                      else [base] * 4)
+                    else:
+                        meld_tiles = ([tile]
+                                      if (not tile.startswith("0") or tile not in self.melds[seat])
+                                      else [base])
+                    self.melds[seat].extend(meld_tiles)
             self.doras = list(action.get("doras") or self.doras)
             self._operations(action.get("operation"))
         elif short == "ActionBaBei":
@@ -305,9 +357,10 @@ class HookStateBuilder:
                 self.nuki[seat] += 1
             if seat == self.own_seat:
                 self._remove("4z")
+                self.hand = sort_hand(self.hand)
             self.doras = list(action.get("doras") or self.doras)
             self._operations(action.get("operation"))
-        elif short in {"ActionHule", "ActionNoTile", "ActionLiuJu"}:
+        elif short in {"ActionHule", "ActionNoTile", "ActionLiuJu", "NotifyGameEndResult", "NotifyGameTerminate"}:
             self.buttons.clear()
             scores = list(action.get("scores", []))
             if len(scores) == self.player_count and all(isinstance(x, int) for x in scores):
@@ -330,7 +383,8 @@ class HookStateBuilder:
             self.chang, self.ju = int(snapshot.get("chang", 0)), int(snapshot.get("ju", 0))
             self.honba, self.sticks = int(snapshot.get("ben", 0)), int(snapshot.get("liqibang", 0))
             self.own_seat = snapshot.get("indexPlayer") if snapshot.get("indexPlayer") is not None else snapshot.get("index_player")
-            self.hand = list(snapshot.get("hands", []))
+            raw_hand = list(snapshot.get("hands", []))
+            self.hand = sort_hand(raw_hand[:13]) + [raw_hand[13]] if len(raw_hand) == 14 else sort_hand(raw_hand)
             self.doras = list(snapshot.get("doras", []))
             for seat, player in enumerate(snapshot.get("players", [])[:self.player_count]):
                 self.scores[seat] = player.get("score")
@@ -345,18 +399,18 @@ class HookStateBuilder:
                 self.riichi[seat] = int(player.get("liqiposition", 0)) > 0
         return self.state()
 
-    def _remove(self, target: str) -> None:
+    def _remove(self, target: str) -> str | None:
         if target in self.hand:
             self.hand.remove(target)
-            return
+            return target
         try:
             wanted = normal(target)
         except ValueError:
-            return
+            return None
         for index, tile in enumerate(self.hand):
             if normal(tile) == wanted:
-                self.hand.pop(index)
-                return
+                return self.hand.pop(index)
+        return None
 
     def _remove_called_discard(self) -> None:
         """Move the called tile from its river into the caller's meld once."""
@@ -439,12 +493,13 @@ class HookProtocol:
             if response_type:
                 # Responses have the same Wrapper as requests; the method is empty.
                 wrapper = decoder.decode("lq.Wrapper", frame[3:])
-                payload = decoder.decode(response_type, wrapper.get("data", b""))
                 if response_type.endswith("ResAuthGame"):
+                    payload = decoder.decode(response_type, wrapper.get("data", b""))
                     seat_list = payload.get("seatList") or payload.get("seat_list") or []
                     if self.auth_account_id is not None and self.auth_account_id in seat_list:
                         self.builder.own_seat = seat_list.index(self.auth_account_id)
                 elif response_type.endswith(("ResSyncGame", "ResEnterGame")):
+                    payload = decoder.decode(response_type, wrapper.get("data", b""))
                     state = self.builder.restore(payload)
                     restore = payload.get("gameRestore") or payload.get("game_restore") or {}
                     for proto in restore.get("actions", []):
@@ -455,6 +510,20 @@ class HookProtocol:
                             self.last_action_name = action_name
                             state = self.builder.apply(action_name, action) or state
                     return state
+                elif response_type.endswith(("ResOauth2Login", "ResLogin", "ResFetchAccountInfo")):
+                    try:
+                        payload = decoder.decode(response_type, wrapper.get("data", b""))
+                        acct = payload.get("account") if isinstance(payload.get("account"), dict) else {}
+                        account_id = (
+                            payload.get("accountId")
+                            or payload.get("account_id")
+                            or acct.get("accountId")
+                            or acct.get("account_id")
+                        )
+                        if isinstance(account_id, int) and account_id > 0:
+                            self.auth_account_id = account_id
+                    except Exception:
+                        pass
         return None
 
     def _message(self, name: str, data: bytes) -> GameState | None:
@@ -462,16 +531,23 @@ class HookProtocol:
         short = name.lstrip(".")
         self.messages_seen += 1
         self.last_message_name = short
-        payload = self.decoder.decode(short, data)
+        leaf = short.rsplit(".", 1)[-1]
         if short.endswith("ActionPrototype"):
+            payload = self.decoder.decode(short, data)
             action_name = str(payload.get("name", "")).lstrip(".")
             action_data = payload.get("data", b"")
             if action_name and isinstance(action_data, bytes):
                 self.last_action_name = action_name
                 action = self.decoder.decode(action_name, decode_action_data(action_data))
                 return self.builder.apply(action_name, action)
-        if short.rsplit(".", 1)[-1].startswith("Action"):
+            return None
+        if leaf.startswith("Action"):
+            payload = self.decoder.decode(short, data)
+            self.last_action_name = short
             return self.builder.apply(short, payload)
+        if leaf in {"NotifyGameEndResult", "NotifyGameTerminate"}:
+            self.builder.buttons.clear()
+            return self.builder.state()
         return None
 
 
@@ -481,10 +557,17 @@ class HookSignals(QObject):
 
 
 class HookBridge:
-    def __init__(self, host: str = HOOK_HOST, port: int = HOOK_PORT):
+    def __init__(
+        self,
+        host: str = HOOK_HOST,
+        port: int = HOOK_PORT,
+        proxy_port: int = DEFAULT_STEAM_PROXY_PORT,
+    ):
         self.host, self.port = host, port
+        self.proxy_port = proxy_port
         self.signals = HookSignals()
         self.protocol = HookProtocol()
+        self._lock = threading.Lock()
         self.last_seen = 0.0
         self._announced = False
         self._schema_announced = False
@@ -511,6 +594,28 @@ class HookBridge:
         if stage != self._last_stage:
             self._last_stage = stage
             self.signals.status.emit(message)
+
+    def ingest_schema(self, schema: dict[str, Any]) -> None:
+        with self._lock:
+            self.protocol.set_schema(schema)
+            self._schema_announced = True
+        self.signals.status.emit("网页 Hook 协议已就绪")
+
+    def ingest_frame(self, direction: str, frame: bytes, connection: str = "") -> GameState | None:
+        with self._lock:
+            self.last_seen = time.monotonic()
+            self.frames_seen += 1
+            first_frame = self.frames_seen == 1
+            state = self.protocol.feed(direction, frame, connection)
+            if state is not None:
+                self.states_seen += 1
+                self._last_stage = "state-ready"
+        if first_frame:
+            self._emit_stage("frames-ready", "已捕获雀魂数据帧 · 正在解析牌局")
+        if state is not None:
+            self.signals.status.emit(f"实时牌局已识别 · 手牌 {len(state.hand)} 张")
+            self.signals.state.emit(state)
+        return state
 
     def _update_browser_diagnostic(self, value: dict[str, Any]) -> None:
         self.browser_diagnostic = value
@@ -542,14 +647,40 @@ class HookBridge:
         bridge = self
 
         class Handler(BaseHTTPRequestHandler):
-            def _reply(self, code=204):
+            def _reply(self, code=204, body: bytes = b"", content_type: str = ""):
                 self.send_response(code)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                if content_type:
+                    self.send_header("Content-Type", content_type)
+                if body:
+                    self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
+                if body:
+                    self.wfile.write(body)
 
             def do_OPTIONS(self):
                 self._reply()
+
+            def do_GET(self):
+                route = self.path.split("?", 1)[0]
+                if route == "/proxy.pac":
+                    pac = build_pac_script(bridge.proxy_port, bridge.host).encode("utf-8")
+                    self._reply(200, pac, "application/x-ns-proxy-autoconfig; charset=utf-8")
+                    return
+                if route == "/health":
+                    payload = json.dumps({
+                        "ok": True,
+                        "connected": bridge.connected,
+                        "live_ready": bridge.live_ready,
+                        "frames_seen": bridge.frames_seen,
+                        "states_seen": bridge.states_seen,
+                        "decode_errors": bridge.decode_errors,
+                        "proxy_port": bridge.proxy_port,
+                    }).encode("utf-8")
+                    self._reply(200, payload, "application/json; charset=utf-8")
+                    return
+                self._reply(404)
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -573,9 +704,7 @@ class HookBridge:
                                 "扩展可连接但没有实时诊断 · 请在 Chrome 扩展页重新加载",
                             )
                     elif self.path == "/schema":
-                        bridge.protocol.set_schema(json.loads(raw))
-                        bridge._schema_announced = True
-                        bridge.signals.status.emit("网页 Hook 协议已就绪")
+                        bridge.ingest_schema(json.loads(raw))
                     elif self.path == "/diagnostic":
                         value = json.loads(raw)
                         if not isinstance(value, dict):
@@ -584,16 +713,11 @@ class HookBridge:
                     elif self.path == "/frame":
                         packet = json.loads(raw)
                         frame = base64.b64decode(packet["data"], validate=True)
-                        bridge.frames_seen += 1
-                        if bridge.frames_seen == 1:
-                            bridge._emit_stage("frames-ready", "已捕获雀魂数据帧 · 正在解析牌局")
-                        state = bridge.protocol.feed(packet.get("direction", "receive"), frame,
-                                                     str(packet.get("socketId") or packet.get("url", "")))
-                        if state is not None:
-                            bridge.states_seen += 1
-                            bridge._last_stage = "state-ready"
-                            bridge.signals.status.emit(f"实时牌局已识别 · 手牌 {len(state.hand)} 张")
-                            bridge.signals.state.emit(state)
+                        bridge.ingest_frame(
+                            packet.get("direction", "receive"),
+                            frame,
+                            str(packet.get("socketId") or packet.get("url", "")),
+                        )
                     self._reply()
                 except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
                     if self.path == "/frame":

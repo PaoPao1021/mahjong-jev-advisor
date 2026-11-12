@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import numpy as np
 import pytest
 
 from mahjong_jev_advisor.llm import (
@@ -17,7 +16,6 @@ from mahjong_jev_advisor.rules import (
 from mahjong_jev_advisor.settings import Settings
 from mahjong_jev_advisor.state import Candidate, GameState
 from mahjong_jev_advisor.tiles import parse_tiles
-from mahjong_jev_advisor.vision import TemplateStore, VisionReader
 from mahjong_jev_advisor.yaku import (
     analyze_yaku_potential, estimate_tenpai_value, evaluate_call_safety,
 )
@@ -121,37 +119,6 @@ def test_chi_options_rejects_impossible_combination():
     )
     with pytest.raises(UncertainState):
         _chi_options(state)
-
-
-def test_template_store_batch_matching(tmp_path):
-    store = TemplateStore(tmp_path)
-    img1 = np.full((64, 48, 3), 180, dtype=np.uint8)
-    img1[20:44, 15:33] = 40
-    img2 = np.full((64, 48, 3), 100, dtype=np.uint8)
-    img2[10:30, 10:40] = 230
-
-    store.add("1m", img1)
-    store.add("9p", img2)
-
-    results = store.match_batch([img1, img2])
-    assert len(results) == 2
-    assert results[0].label == "1m" and results[0].confidence > 0.95
-    assert results[1].label == "9p" and results[1].confidence > 0.95
-
-
-def test_vision_noise_without_buttons_does_not_fail():
-    reader = VisionReader({
-        "hand": (0, 0, 0.5, 0.1),
-        "draw": (0.5, 0, 0.05, 0.1),
-        "buttons": (0.6, 0, 0.2, 0.1),
-    })
-    # Mock OCR returning noise with low confidence
-    reader._ocr_text = lambda img: ("·", 0.45)
-    reader._tiles = lambda frame, name: (["1m"] * (13 if name == "hand" else 1), 0.98, 0)
-    frame = np.zeros((100, 100, 3), dtype=np.uint8)
-    obs = reader.analyze(frame)
-    # Background noise like "·" without any button keywords should NOT flag OCR problems
-    assert "操作按钮 OCR 置信度不足" not in obs.problems
 
 
 def test_llm_format_prompt():

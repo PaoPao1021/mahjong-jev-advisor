@@ -1,6 +1,6 @@
 #!/bin/zsh
 set -e
-trap 'echo "Startup failed. Check Python 3.12+, dependencies and macOS Screen Recording permission." >&2' ZERR
+trap 'echo "Startup failed. Check Python 3.12+ and project dependencies." >&2' ZERR
 cd "$(dirname "$0")"
 if [[ ! -x .venv/bin/python ]]; then
   if command -v python3.12 >/dev/null; then
@@ -10,7 +10,7 @@ if [[ ! -x .venv/bin/python ]]; then
   fi
 fi
 .venv/bin/python -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)'
-if ! .venv/bin/python -c 'import mahjong_jev_advisor, PySide6.QtWidgets, cv2, mss, rapidocr_onnxruntime, mahjong'; then
+if ! .venv/bin/python -c 'import mahjong_jev_advisor, PySide6.QtWidgets, mitmproxy, mahjong'; then
   .venv/bin/python -m pip install -e .
 fi
 .venv/bin/python -m pip check

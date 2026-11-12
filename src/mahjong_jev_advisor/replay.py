@@ -1,15 +1,14 @@
-"""Offline state and screenshot replay with measurable recognition/latency."""
+"""Offline GameState and Liqi WebSocket frame replay with measurable latency."""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import statistics
 import sys
 import time
 from pathlib import Path
-
-import cv2
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -22,11 +21,11 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
+from .hook import HookProtocol
 from .jev import JevError, advise
 from .rules import NoDecision, UncertainState, candidates, local_choice
 from .settings import Settings
 from .state import Advice, GameState
-from .vision import TemplateStore, VisionReader
 
 
 def percentile_95(values: list[float]) -> float:
@@ -44,29 +43,41 @@ def _states(path: Path):
         yield line_number, GameState.from_dict(data.get("state", data))
 
 
-def _frames(path: Path, settings: Settings):
-    reader = VisionReader(settings.regions, TemplateStore(settings.template_dir()))
-    for file in sorted([*path.glob("*.png"), *path.glob("*.jpg")]):
-        frame = cv2.imread(str(file))
-        if frame is None:
-            yield file.name, None, ["图片无法读取"]
+def _frames(path: Path):
+    protocol = HookProtocol()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
             continue
-        obs = reader.analyze(frame, 0)
-        yield file.name, obs.state, list(obs.problems)
+        packet = json.loads(line)
+        if "seat" in packet and isinstance(packet["seat"], int):
+            protocol.builder.own_seat = packet["seat"]
+        try:
+            raw = (
+                bytes.fromhex(packet["hex"])
+                if "hex" in packet
+                else base64.b64decode(packet["data"], validate=True)
+            )
+            state = protocol.feed(
+                packet.get("direction", "receive"),
+                raw,
+                str(packet.get("socketId") or packet.get("url", "")),
+            )
+            if state is not None:
+                yield str(packet.get("frame", line_number)), state, []
+        except Exception as error:
+            yield str(packet.get("frame", line_number)), None, [str(error)]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay states or calibrated Mahjong Soul screenshots")
+    parser = argparse.ArgumentParser(description="Replay GameStates or recorded Liqi WebSocket frames")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--states", type=Path, help="JSONL with one GameState per line")
-    source.add_argument("--frames", type=Path, help="Directory of recorded game-region PNG/JPG frames")
+    source.add_argument("--frames", type=Path, help="JSONL with recorded Liqi WebSocket frames (base64 data or hex)")
     parser.add_argument("--online", action="store_true", help="Use Jev; default is the local rules baseline")
     parser.add_argument("--truth", type=Path, help="Optional JSONL truth for --frames; fields hand and buttons")
     parser.add_argument("--output", type=Path, help="Optional output JSONL")
     args = parser.parse_args()
     settings = Settings.load()
-    if args.frames and not settings.regions:
-        parser.error("Calibrate regions in the app before replaying screenshots")
     if args.online and not settings.api_key:
         parser.error("--online requires an API Key for the selected provider in Settings")
     truth = {}
@@ -74,10 +85,11 @@ def main() -> None:
         for line in args.truth.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 item = json.loads(line)
-                truth[item["frame"]] = item
+                truth[str(item["frame"])] = item
     source_rows = (
         ((str(n), state, []) for n, state in _states(args.states))
-        if args.states else _frames(args.frames, settings)
+        if args.states
+        else _frames(args.frames)
     )
     latencies: list[float] = []
     results: list[dict] = []

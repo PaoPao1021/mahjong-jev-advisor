@@ -30,10 +30,11 @@ def config_dir() -> Path:
 
 @dataclass
 class Settings:
-    game_box: tuple[int, int, int, int] | None = None
-    regions: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
     input_source: str = field(default_factory=default_input_source)
-    capture_profiles: dict[str, Any] = field(default_factory=dict)
+    steam_capture_mode: str = "process"
+    steam_process_name: str = "Jantama_MahjongSoul"
+    steam_proxy_port: int = 10999
+    steam_upstream_proxy: str = ""
     api_key: str = ""
     model_endpoint: str = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model"
     model_name: str = "typesafe-ai/jev-latest"
@@ -72,9 +73,10 @@ class Settings:
 
         return cls(
             input_source=data.get("input_source", default_input_source()),
-            capture_profiles=data.get("capture_profiles", {}),
-            game_box=tuple(data["game_box"]) if data.get("game_box") else None,
-            regions={k: tuple(v) for k, v in data.get("regions", {}).items()},
+            steam_capture_mode=str(data.get("steam_capture_mode", "process")),
+            steam_process_name=str(data.get("steam_process_name", "Jantama_MahjongSoul")).strip() or "Jantama_MahjongSoul",
+            steam_proxy_port=max(1024, min(65535, int(data.get("steam_proxy_port", 10999)))),
+            steam_upstream_proxy=str(data.get("steam_upstream_proxy", "")).strip(),
             # Old api_key entries were TypeSafe credentials and must not be sent to Vercel.
             api_key=data.get("gateway_api_key", "") or (os.environ.get(env_name, "") if env_name else ""),
             model_endpoint=str(data.get("model_endpoint", cls.model_endpoint)),
@@ -99,41 +101,37 @@ class Settings:
             raise ValueError("Configuration must be an object")
         if data.get("input_source", "browser") not in {"browser", "steam"}:
             raise ValueError("Invalid input source")
-        profiles = data.get("capture_profiles", {})
-        if not isinstance(profiles, dict) or profiles.keys() - {"browser", "steam"}:
-            raise ValueError("Invalid capture profiles")
-        for profile in profiles.values():
-            if not isinstance(profile, dict) or profile.keys() - {"game_box", "regions"}:
-                raise ValueError("Invalid capture profile")
-            Settings._validate_data(profile)
-        for key in ("gateway_api_key", "model_endpoint", "model_name", "model_protocol", "llm_base_url", "llm_api_key", "llm_model"):
+        if data.get("steam_capture_mode", "process") not in {"process", "proxy"}:
+            raise ValueError("Invalid steam capture mode")
+        for key in (
+            "gateway_api_key",
+            "model_endpoint",
+            "model_name",
+            "model_protocol",
+            "llm_base_url",
+            "llm_api_key",
+            "llm_model",
+            "steam_process_name",
+            "steam_upstream_proxy",
+        ):
             if key in data and not isinstance(data[key], str):
                 raise ValueError("Invalid text field")
         urlsplit(data.get("model_endpoint", Settings.model_endpoint))
         for key in ("local_fallback", "logging_enabled", "show_table", "always_on_top"):
             if key in data and type(data[key]) is not bool:
                 raise ValueError("Invalid boolean field")
-        for key in ("model_timeout", "ui_interval_ms", "opacity"):
+        for key in ("model_timeout", "ui_interval_ms", "opacity", "steam_proxy_port"):
             if key in data and (type(data[key]) not in (float, int) or not math.isfinite(data[key])):
                 raise ValueError("Invalid numeric field")
+        if "steam_proxy_port" in data and (
+            type(data["steam_proxy_port"]) is not int or not (1 <= data["steam_proxy_port"] <= 65535)
+        ):
+            raise ValueError("Invalid steam proxy port")
         geometry = data.get("window_geometry")
         if geometry is not None and (not isinstance(geometry, (list, tuple)) or len(geometry) != 4
                 or any(type(v) is not int or abs(v) > 100000 for v in geometry)
                 or geometry[2] <= 0 or geometry[3] <= 0):
             raise ValueError("Invalid window geometry")
-        box = data.get("game_box")
-        if box is not None and (not isinstance(box, (list, tuple)) or len(box) != 4
-                or any(type(v) is not int for v in box) or box[2] <= 0 or box[3] <= 0):
-            raise ValueError("Invalid game box")
-        regions = data.get("regions", {})
-        if not isinstance(regions, dict):
-            raise ValueError("Invalid regions")
-        for rect in regions.values():
-            if (not isinstance(rect, (list, tuple)) or len(rect) != 4
-                    or any(type(v) not in (float, int) or not math.isfinite(v) for v in rect)
-                    or rect[0] < 0 or rect[1] < 0 or rect[2] <= 0 or rect[3] <= 0
-                    or rect[0] + rect[2] > 1.001 or rect[1] + rect[3] > 1.001):
-                raise ValueError("Invalid region coordinates")
 
     def save(self) -> None:
         directory = config_dir()
@@ -141,9 +139,10 @@ class Settings:
         path = directory / "settings.json"
         data = {
             "input_source": self.input_source,
-            "capture_profiles": self.capture_profiles,
-            "game_box": self.game_box,
-            "regions": self.regions,
+            "steam_capture_mode": self.steam_capture_mode,
+            "steam_process_name": self.steam_process_name,
+            "steam_proxy_port": self.steam_proxy_port,
+            "steam_upstream_proxy": self.steam_upstream_proxy,
             "gateway_api_key": self.api_key,
             "model_endpoint": self.model_endpoint,
             "model_name": self.model_name,
@@ -188,18 +187,7 @@ class Settings:
     def switch_input_source(self, source: str) -> None:
         if source not in {"browser", "steam"}:
             raise ValueError("Invalid input source")
-        if source == self.input_source:
-            return
-        self.capture_profiles[self.input_source] = {
-            "game_box": self.game_box, "regions": dict(self.regions),
-        }
-        profile = self.capture_profiles.get(source, {})
-        self.game_box = tuple(profile["game_box"]) if profile.get("game_box") else None
-        self.regions = {key: tuple(value) for key, value in profile.get("regions", {}).items()}
         self.input_source = source
-
-    def template_dir(self) -> Path:
-        return config_dir() / ("templates-steam" if self.input_source == "steam" else "templates")
 
     def connection(self):
         from .jev import ModelConnection

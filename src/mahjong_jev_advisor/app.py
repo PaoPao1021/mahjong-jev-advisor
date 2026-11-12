@@ -3,47 +3,41 @@
 from __future__ import annotations
 
 import ctypes
-import math
 import sys
 import time
 import traceback
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .resources import extension_dir
 from typing import Any
+import os
 
-import cv2
-import mss
-import numpy as np
-from PySide6.QtCore import QEvent, QPoint, QRect, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QFontDatabase, QIcon, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QLayout, QMainWindow, QMenu, QMessageBox,
-    QScrollArea, QVBoxLayout, QWidget, QInputDialog,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 
 from .edition import launch_edition
-from .desktop_capture import GameWindow, WindowUnavailable, client_box, game_windows
 from .jev import JevError, advise
 from .hook import HookBridge
 from .rules import (
-    NoDecision, UncertainState, candidates, danger, dora_value, discard_comparison,
-    shanten, shanten_text, ukeire_details, yaku_hints,
+    NoDecision, UncertainState, candidates, danger_level, discard_candidate,
+    discard_comparison, shanten_text,
 )
-from .settings import Settings, append_decision_log, config_dir
+from .settings import Settings, append_decision_log
 from .state import Advice, Candidate, GameState
+from .steam_capture import SteamCaptureBridge
 from .ui_components import (
     BottomActionBar, FourPlayersRiverWidget, HandWidget, HUDTitleBar,
     DecisionHeroCard, RoundInfoBar,
 )
 from .ui_dialogs import (
-    JevSettingsDialog, LLMAnalysisDialog, LLMSettingsDialog, ManualStateDialog,
-    RegionDialog, TemplateDialog, DiscardComparisonDialog,
-)
-from .vision import (
-    REGIONS, Observation, TemplateStore, VisionReader, detect_basic_regions,
-    learn_templates_from_state,
+    DiscardComparisonDialog, JevSettingsDialog, LLMAnalysisDialog,
+    LLMSettingsDialog, ManualStateDialog, SteamConnectionDialog,
 )
 
 
@@ -98,49 +92,10 @@ def exclude_window_from_capture(hwnd: int) -> bool:
         return False
 
 
-def capture_box(box: tuple[int, int, int, int]) -> np.ndarray:
-    x, y, width, height = box
-    with mss.MSS() as grabber:
-        image = np.asarray(grabber.grab({"left": x, "top": y, "width": width, "height": height}))
-    return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-
-
-def capture_desktop() -> tuple[np.ndarray, tuple[int, int]]:
-    with mss.MSS() as grabber:
-        monitor = grabber.monitors[0]
-        image = np.asarray(grabber.grab(monitor))
-    return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR), (monitor["left"], monitor["top"])
-
-
-from PySide6.QtCore import QObject
-
-
 class TaskSignals(QObject):
     captured = Signal()
     done = Signal(object)
     failed = Signal(object)
-
-
-class CaptureSignals(QObject):
-    captured = Signal()
-    done = Signal(object, int)
-    failed = Signal(str, int)
-
-
-class CaptureWorker(QRunnable):
-    def __init__(self, box: tuple[int, int, int, int], reader: VisionReader, seat: int, generation: int = 0):
-        super().__init__()
-        self.box, self.reader, self.seat = box, reader, seat
-        self.generation = generation
-        self.signals = CaptureSignals()
-
-    def run(self) -> None:
-        try:
-            frame = capture_box(self.box)
-            self.signals.captured.emit()
-            self.signals.done.emit(self.reader.analyze(frame, self.seat), self.generation)
-        except Exception:
-            self.signals.failed.emit(traceback.format_exc(limit=3), self.generation)
 
 
 class AdviceWorker(QRunnable):
@@ -166,6 +121,10 @@ class AdviceWorker(QRunnable):
             self.signals.failed.emit((self.state.identity(), traceback.format_exc(limit=3)))
 
 
+def _candidate_display_label(candidate: Candidate) -> str:
+    return candidate.tile if candidate.action == "discard" and candidate.tile else candidate.label
+
+
 def _demo_reference_state() -> GameState:
     """Provides the exact match state shown in the reference image for instant preview."""
     return GameState.from_dict({
@@ -182,7 +141,7 @@ def _demo_reference_state() -> GameState:
         "seat": 0,
         "round_wind": "E",
         "round_number": 1,
-        "seat_wind": "N",
+        "seat_wind": "E",
         "scores": [25000, 25000, 25000, 25000],
         "riichi": [False, False, False, True],
         "honba": 0,
@@ -195,7 +154,7 @@ def _demo_reference_state() -> GameState:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        edition_label = {"browser": " · 网页版", "steam": " · Steam 版（实验性）"}.get(launch_edition(), "")
+        edition_label = {"browser": " · 网页版", "steam": " · Steam 版"}.get(launch_edition(), "")
         self.setWindowTitle("雀魂 · Jev 实时切牌顾问" + edition_label)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
 
@@ -205,16 +164,20 @@ class MainWindow(QMainWindow):
         self._comparison_state_available = False
         edition = launch_edition()
         if edition:
-            # Recover settings imported from the other edition without mixing calibration.
             self.settings.switch_input_source(edition)
         self._capture_excluded = False
         self._capture_generation = 0
-        self._steam_window: GameWindow | None = None
-        self.templates = TemplateStore(self.settings.template_dir())
-        self.reader = VisionReader(self.settings.regions, self.templates)
-        self.hook = HookBridge()
+        self.hook = HookBridge(proxy_port=self.settings.steam_proxy_port)
         self.hook.signals.state.connect(self.on_hook_state)
         self.hook.signals.status.connect(self.on_hook_status)
+        self.steam = SteamCaptureBridge(
+            mode=self.settings.steam_capture_mode,
+            process_name=self.settings.steam_process_name,
+            proxy_port=self.settings.steam_proxy_port,
+            upstream_proxy=self.settings.steam_upstream_proxy,
+        )
+        self.steam.signals.state.connect(self.on_steam_state)
+        self.steam.signals.status.connect(self.on_steam_status)
         self.pool = QThreadPool.globalInstance()
 
         self.capture_busy = False
@@ -224,10 +187,13 @@ class MainWindow(QMainWindow):
         self.manual = False
         self.last_state: GameState | None = None
         self.pending_identity: tuple[Any, ...] | None = None
+        self._explicit_request_identity: tuple[Any, ...] | None = None
         self.stable_count = 0
         self.advised_identity: tuple[Any, ...] | None = None
         self.active_advice_identity: tuple[Any, ...] | None = None
         self._current_chosen: Candidate | None = None
+        self._simulation_identity: tuple[Any, ...] | None = None
+        self._rendered_identity: tuple[Any, ...] | None = None
         self._demo_preview = False
         self._screen_bound = False
         self._connection_revision = 0
@@ -304,6 +270,8 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.bottom_bar)
         self.compare_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
         self.compare_shortcut.activated.connect(self.show_discard_comparison)
+        self.recompute_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.recompute_shortcut.activated.connect(self._force_recompute_advice)
 
         self.setMinimumSize(320, 320)
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
@@ -317,28 +285,28 @@ class MainWindow(QMainWindow):
             self.resize(390, 720)
         self.setWindowOpacity(self.settings.opacity)
 
-        # Periodic capture timer
         self.timer = QTimer(self)
         self.timer.setInterval(self.settings.ui_interval_ms)
-        self.timer.timeout.connect(self.capture_tick)
 
         self.clear_state()
         if self.settings.input_source == "browser":
             self.hook.start()
-
-        # If game_box is configured, automatically start real-time monitoring
-        if self.settings.input_source == "browser" and self.settings.game_box and all(name in self.settings.regions for name in ("hand", "draw", "buttons")):
-            generation = self._capture_generation
-            QTimer.singleShot(300, lambda: self.toggle_recognition()
-                              if self.settings.input_source == "browser" and generation == self._capture_generation else None)
-        elif self.settings.input_source == "steam":
-            self.bottom_bar.set_status_info("Steam 截图模式 · 四人布局", "请确认当前牌桌位置或重新绑定窗口，再点击开始识别；三人局请手动核对")
-        elif self.settings.game_box:
-            self.title_bar.set_status("待校准", "warning")
-            self.bottom_bar.set_status_info("牌桌已选择，识别未就绪", "请在【桌】完成基础校准和牌面样本标注")
+            self.title_bar.set_status("等待连接", "idle")
+            self.bottom_bar.set_status_info("网页 Hook 监听中", "打开或刷新雀魂网页即可自动捕获实时牌局")
         else:
-            self.title_bar.set_status("待选牌桌", "idle")
-            self.bottom_bar.set_status_info("等待绑定", "点击右上角【桌】绑定雀魂窗口以开启实时监测")
+            self.title_bar.set_status("Steam 就绪", "idle")
+            self.bottom_bar.set_status_info(
+                "Steam 实时协议模式",
+                "点击【开始识别】启动毫秒级协议直连；首次使用可在【桌】安装本地证书",
+            )
+            if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+                generation = self._capture_generation
+                QTimer.singleShot(
+                    200,
+                    lambda: self.toggle_recognition()
+                    if self.settings.input_source == "steam" and not self.running and generation == self._capture_generation
+                    else None,
+                )
         if self.settings.load_warning:
             self.title_bar.set_status("配置待修复", "warning")
             self.bottom_bar.set_status_info("配置读取异常", self.settings.load_warning)
@@ -392,8 +360,9 @@ class MainWindow(QMainWindow):
             shanten_num=2,
             confidence=0.78,
             probabilities=probabilities,
-            fold_rate=28,
-            danger_score=1.03,
+            danger_label="注意",
+            danger_key="watch",
+            threat_note="立直 1 家",
             draw_info="摸切 6",
             melds_count=2,
             alternatives=["2s", "4p"],
@@ -401,7 +370,7 @@ class MainWindow(QMainWindow):
             raw_detail="2向听 · 有效牌约 24 张 · 危险级 1 · 役牌候选、门清",
         )
         self.hero_card.stats_line_1.setText("示例选择比例 0.83 · 示例置信度 0.78")
-        self.hero_card.stats_line_2.setText("示例风险分 1.03 · 非真实牌局测量")
+        self.hero_card.stats_line_2.setText("示例危险档位 · 非真实牌局测量")
         self.hand_widget.set_hand(demo.hand, highlight_tile="1p")
         self.bottom_bar.set_status_info(
             "示范牌局 · 非实时",
@@ -462,25 +431,24 @@ class MainWindow(QMainWindow):
         edition = launch_edition()
         if not edition:
             source_menu = menu.addMenu("输入来源")
-            for source, label in (("browser", "浏览器（Hook 优先）"), ("steam", "Steam 客户端（截图）")):
+            for source, label in (
+                ("browser", "浏览器（网页 Hook 实时协议）"),
+                ("steam", "Steam 客户端（实时协议直连）"),
+            ):
                 action = source_menu.addAction(label)
                 action.setCheckable(True)
                 action.setChecked(self.settings.input_source == source)
                 action.triggered.connect(lambda checked=False, value=source: self.set_input_source(value))
         else:
-            menu.addAction("网页版" if edition == "browser" else "Steam 版（实验性）").setEnabled(False)
+            menu.addAction("网页版" if edition == "browser" else "Steam 版（实时协议）").setEnabled(False)
         if edition != "browser":
-            menu.addAction("绑定 Steam 雀魂窗口（Windows）", self.bind_steam_window)
+            menu.addAction("Steam 实时连接与证书设置...", self.edit_steam_settings)
+            menu.addAction("查看 Steam 协议实时诊断", self.show_steam_diagnostic)
+            menu.addAction("重启 Steam 捕获引擎", self.restart_steam_capture)
         menu.addSeparator()
         if edition != "steam":
             menu.addAction("打开网页 Hook 扩展目录", self.open_hook_extension)
             menu.addAction("查看网页 Hook 诊断", self.show_hook_diagnostic)
-        menu.addSeparator()
-        menu.addAction("选择牌桌画面", self.select_game)
-        menu.addAction("基础区域校准", lambda: self.calibrate(False))
-        menu.addAction("扩展区域校准", lambda: self.calibrate(True))
-        menu.addAction("标注牌面样本", self.label_templates)
-        menu.addAction("保存当前帧截图", self.save_frame)
         menu.addSeparator()
         pin = menu.addAction("窗口置顶")
         pin.setCheckable(True)
@@ -532,85 +500,83 @@ class MainWindow(QMainWindow):
         self.manual = False
         self.timer.stop()
         self._hook_active = False
-        self._steam_window = None
         self._capture_generation += 1
         self._connection_revision += 1  # Invalidate advice from the previous input.
         self.settings.switch_input_source(source)
         self.settings.save()
-        self.templates = TemplateStore(self.settings.template_dir())
-        self.reader = VisionReader(self.settings.regions, self.templates)
         self.clear_state()
         self.bottom_bar.btn_toggle.setText("开始识别")
         if source == "steam":
             self.hook.stop()
-            self.bottom_bar.set_status_info("Steam 截图模式 · 四人布局", "先绑定窗口或选择牌桌画面，再校准并核对手牌；三人局请使用手动核对")
+            self.bottom_bar.set_status_info(
+                "Steam 实时协议模式",
+                "点击【开始识别】启动毫秒级协议直连；首次使用可在【桌】安装本地证书",
+            )
         else:
+            self.steam.stop()
             self.hook.start()
-            self.bottom_bar.set_status_info("浏览器模式", "刷新雀魂网页以重新建立 Hook 连接，或使用截图识别")
+            self.bottom_bar.set_status_info("浏览器模式", "刷新雀魂网页以建立网页 Hook 实时连接")
 
-    def bind_steam_window(self) -> None:
-        try:
-            windows = game_windows()
-            if not windows:
-                raise WindowUnavailable("未找到雀魂游戏窗口，请先运行 Steam 雀魂；也可手动选择牌桌画面")
-            labels = [f"{w.title} · PID {w.pid} · 窗口 {w.handle}" for w in windows]
-            choice, ok = QInputDialog.getItem(self, "绑定 Steam 雀魂窗口", "选择游戏窗口（保持窗口化且无遮挡）：", labels, 0, False)
-            if not ok:
-                return
-            window = windows[labels.index(choice)]
-            box = client_box(window)
-        except WindowUnavailable as error:
-            QMessageBox.information(self, "窗口绑定", str(error))
-            return
+    def edit_steam_settings(self) -> None:
+        dialog = SteamConnectionDialog(self.settings, self.steam.diagnostic_snapshot(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.settings.steam_capture_mode = dialog.mode_combo.currentData()
+            self.settings.steam_process_name = dialog.process_name.text().strip() or "Jantama_MahjongSoul"
+            self.settings.steam_proxy_port = int(dialog.proxy_port.value())
+            self.settings.steam_upstream_proxy = dialog.upstream_proxy.text().strip()
+            self.settings.save()
+            self.hook.proxy_port = self.settings.steam_proxy_port
+            self.steam.configure(
+                mode=self.settings.steam_capture_mode,
+                process_name=self.settings.steam_process_name,
+                proxy_port=self.settings.steam_proxy_port,
+                upstream_proxy=self.settings.steam_upstream_proxy,
+            )
+            self.bottom_bar.set_status_info(
+                "Steam 连接配置已保存",
+                f"模式：{self.settings.steam_capture_mode} · 进程：{self.settings.steam_process_name} · 端口：{self.settings.steam_proxy_port}",
+            )
+
+    def restart_steam_capture(self) -> None:
+        self.steam.stop()
         self.set_input_source("steam")
-        self._steam_window = window
-        self._bind_capture_box(box)
+        if self.steam.start():
+            self._hook_active = self.steam.live_ready
+            self._begin_realtime("Steam 捕获引擎已重启 · 正在监听雀魂对局协议")
+        else:
+            self.bottom_bar.set_status_info("Steam 捕获启动失败", self.steam.last_error or "请检查【桌】-> Steam 实时连接设置")
 
-    def _bind_capture_box(self, box: tuple[int, int, int, int]) -> None:
-        self.running = False
-        self.timer.stop()
-        self._capture_generation += 1
-        self._connection_revision += 1
-        self.settings.game_box = box
-        self.settings.regions = {}  # A new target needs calibration, even at the same size.
-        self.settings.save()
-        self.reader = VisionReader({}, self.templates)
-        self.clear_state()
-        self.bottom_bar.btn_toggle.setText("开始识别")
-        self.bottom_bar.set_status_info("已绑定牌桌", "点击开始识别进行校准与手牌核对；请保持游戏可见且无遮挡")
-
-    def _update_steam_window(self) -> bool:
-        if self.settings.input_source != "steam" or self._steam_window is None:
-            return True
-        try:
-            box = client_box(self._steam_window)
-            old = self.settings.game_box
-            if old and box[2:] != old[2:]:
-                self._bind_capture_box(box)
-                self.bottom_bar.set_status_info("游戏窗口大小已改变", "请重新校准后点击开始识别")
-                return False
-            if old and box != old:
-                self._capture_generation += 1
-                self.clear_state()
-            self.settings.game_box = box
-            return True
-        except WindowUnavailable as error:
-            self._capture_generation += 1
-            self.clear_state()
-            self.on_capture_failure(str(error))
-            return False
-
-    def _on_capture_result(self, observation: Observation, generation: int) -> None:
-        self.capture_busy = False
-        if generation != self._capture_generation or not self._update_steam_window():
-            return
-        if generation == self._capture_generation:
-            self.on_observation(observation)
-
-    def _on_capture_error(self, error: str, generation: int) -> None:
-        self.capture_busy = False
-        if generation == self._capture_generation:
-            self.on_capture_failure(error)
+    def show_steam_diagnostic(self) -> None:
+        snap = self.steam.diagnostic_snapshot()
+        procs = snap.get("detected_processes") or []
+        proc_desc = (
+            "，".join(f"{p['name']}(PID {p['pid']})" for p in procs)
+            if procs
+            else "未检测到运行中的雀魂进程"
+        )
+        mode_desc = (
+            f"进程直连 ({snap.get('active_mode_spec') or ('local:' + snap['process_name'])})"
+            if snap["mode"] == "process" and not snap["fallback_active"]
+            else f"本地代理 (127.0.0.1:{snap['proxy_port']})"
+        )
+        lines = [
+            f"运行状态：{'监听中' if snap['running'] else '未启动'}",
+            f"当前模式：{mode_desc}",
+            f"本地 CA 证书：{'已安装并信任' if snap['cert_installed'] else '未安装（请在【桌】一键安装）'}",
+            f"运行中雀魂进程：{proc_desc}",
+            f"活跃 WebSocket：{snap['ws_connections']} 个",
+            f"已捕获协议帧：{snap['frames_seen']}",
+            f"已解码消息数：{self.steam.protocol.messages_seen}",
+            f"已重建牌局状态：{snap['states_seen']}",
+            f"解码错误：{snap['decode_errors']}",
+            f"最近协议消息：{snap['last_message_name'] or '无'}",
+            f"最近对局动作：{snap['last_action_name'] or '无'}",
+            f"连接主机：{snap['last_host'] or '等待连接'}",
+            f"系统 PAC 地址：http://127.0.0.1:{ self.hook.port }/proxy.pac",
+        ]
+        if snap.get("last_error"):
+            lines.append(f"最近提示：{snap['last_error']}")
+        QMessageBox.information(self, "Steam 协议实时诊断", "\n".join(lines))
 
     def open_hook_extension(self) -> None:
         directory = extension_dir()
@@ -639,7 +605,21 @@ class MainWindow(QMainWindow):
                 detail += f"\n最近错误：{self.hook.last_error}"
         QMessageBox.information(self, "网页 Hook 诊断", detail)
 
+    def _clear_current_decision(self) -> None:
+        self._current_chosen = None
+        self._simulation_identity = None
+        for slot in (*self.hand_widget.hand_slots, self.hand_widget.draw_slot):
+            slot.set_glowing(False)
+
     def _render_state(self, state: GameState, highlight_tile: str | None = None) -> None:
+        identity = state.identity()
+        if identity != self._rendered_identity:
+            self._clear_current_decision()
+            if self._explicit_request_identity != identity:
+                self._explicit_request_identity = None
+        elif highlight_tile is None and self._current_chosen is not None:
+            highlight_tile = self._current_chosen.tile
+        self._rendered_identity = identity
         self._comparison_state_available = True
         if self._comparison_dialog is not None:
             self._comparison_dialog.mark_current_state(state)
@@ -651,8 +631,10 @@ class MainWindow(QMainWindow):
         seat_desc = f"{state.player_count}人 · {dict(E='东', S='南', W='西', N='北').get(state.seat_wind, '?')}家"
         self.round_bar.set_round_info(
             round_wind=state.round_wind,
-            round_num=state.round_number or 1,
-            remaining_tiles=max(0, (55 if state.player_count == 3 else 70) - sum(len(r) for r in state.rivers) - sum(state.nuki)),
+            round_num=state.round_number,
+            # GameState does not track the live wall. Rivers and concealed
+            # hand length cannot reconstruct it after calls or replacement draws.
+            remaining_tiles=None,
             seat_desc=seat_desc,
             honba=state.honba,
             sticks=state.sticks,
@@ -666,19 +648,30 @@ class MainWindow(QMainWindow):
             rivers=state.rivers,
             melds=state.melds,
             my_seat=state.seat,
+            seat_wind=state.seat_wind,
         )
 
-    def _calculate_metrics(self, state: GameState, chosen: Candidate) -> tuple[int, float, list[tuple[str, int, bool]]]:
-        """Calculates fold rate %, danger score, and display probability distribution."""
-        threats = sum(1 for i, r in enumerate(state.riichi) if r and i != state.seat)
-        raw_danger = chosen.danger or 0
-
-        danger_score = round(1.0 + (raw_danger * 0.12) + (threats * 0.45), 2)
-
-        if threats > 0:
-            fold_rate = min(95, max(15, 20 + threats * 25 + raw_danger * 5))
+    @staticmethod
+    def _danger_metrics(state: GameState, chosen: Candidate) -> tuple[str, str, str]:
+        """Describe observed threats without computing unrelated discard options."""
+        opponents = [r for i, r in enumerate(state.riichi) if i != state.seat]
+        threats = sum(r is True for r in opponents)
+        unknown = sum(r is None for r in opponents)
+        if unknown:
+            danger_label, danger_key = danger_level(None)
+            threat_note = f"立直 {threats} 家 · {unknown} 家未知" if threats else "立直状态未知"
+        elif threats:
+            danger_label, danger_key = danger_level(chosen.danger)
+            threat_note = f"立直 {threats} 家"
         else:
-            fold_rate = max(5, min(40, (chosen.shanten if chosen.shanten is not None else 1) * 12))
+            danger_label, danger_key = "未评估", "unknown"
+            threat_note = "未见对手立直"
+        return danger_label, danger_key, threat_note
+
+    def _calculate_metrics(self, state: GameState, chosen: Candidate) -> tuple[str, str, str, list[tuple[str, int, bool]], list[Candidate]]:
+        """Banded danger and local candidate scores, never deal-in probabilities."""
+        danger_label, danger_key, threat_note = self._danger_metrics(state, chosen)
+        threats = sum(r is True for i, r in enumerate(state.riichi) if i != state.seat)
 
         opts: list[Candidate] = []
         try:
@@ -700,11 +693,10 @@ class MainWindow(QMainWindow):
             total_eff = sum(scores) or 1.0
             raw_pcts = [int(round(s / total_eff * 88)) for s in scores]
 
-            top_tile = chosen.tile or chosen.label
             for i, opt in enumerate(opts):
-                lbl = opt.tile or opt.label
+                lbl = _candidate_display_label(opt)
                 pct = max(3, raw_pcts[i])
-                bar_items.append((lbl, pct, opt.tile == chosen.tile))
+                bar_items.append((lbl, pct, opt == chosen))
             bar_items.sort(key=lambda x: -x[1])
             bar_items = bar_items[:4]
             allocated = sum(x[1] for x in bar_items)
@@ -714,9 +706,9 @@ class MainWindow(QMainWindow):
             else:
                 bar_items.append(("等待", rem, False))
         else:
-            bar_items = [(chosen.tile or chosen.label, 85, True)]
+            bar_items = [(_candidate_display_label(chosen), 85, True)]
 
-        return fold_rate, danger_score, bar_items
+        return danger_label, danger_key, threat_note, bar_items, opts
 
     def on_advice(self, result: tuple[tuple[Any, ...], Advice, GameState]) -> None:
         self.advice_busy = False
@@ -726,26 +718,34 @@ class MainWindow(QMainWindow):
             return
 
         self.advised_identity = identity
+        self._explicit_request_identity = None
+        if self.settings.logging_enabled:
+            append_decision_log({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "state": state.to_dict(),
+                "advice": advice.to_dict(),
+            })
+        if self._simulation_identity == identity:
+            return
         chosen = advice.selected
-        self._current_chosen = chosen
         rec_tile = chosen.tile or ""
 
         # Update hand tile highlight
         self._render_state(state, highlight_tile=rec_tile)
+        self._current_chosen = chosen
 
-        # Calculate rich stats (fold rate, danger score, bars)
-        fold_rate, danger_score, bar_items = self._calculate_metrics(state, chosen)
+        # Calculate banded danger and candidate bars
+        danger_label, danger_key, threat_note, bar_items, opts = self._calculate_metrics(state, chosen)
         if advice.source == "jev":
             bar_items = []
 
         # If Jev returned explicit probabilities, merge them
         if advice.source == "jev" and advice.probabilities:
             try:
-                opts = candidates(state)
                 mapped = []
                 for i, opt in enumerate(opts):
                     key = f"a{i}"
-                    lbl = opt.tile or opt.label
+                    lbl = _candidate_display_label(opt)
                     prob = advice.probabilities.get(key, 0.0)
                     pct = int(round(prob * 100))
                     mapped.append((lbl, pct, opt == chosen))
@@ -758,7 +758,7 @@ class MainWindow(QMainWindow):
 
         action_name = "切牌" if chosen.action == "discard" else chosen.label
 
-        alternatives_list = [alt.tile or alt.label for alt in advice.alternatives[:3]]
+        alternatives_list = [_candidate_display_label(alt) for alt in advice.alternatives[:3]]
 
         source_note = (
             f"在线模型 {advice.model or 'latest'} · {advice.latency_ms}ms"
@@ -780,8 +780,9 @@ class MainWindow(QMainWindow):
             shanten_num=chosen.shanten,
             confidence=advice.confidence,
             probabilities=bar_items,
-            fold_rate=fold_rate,
-            danger_score=danger_score,
+            danger_label=danger_label,
+            danger_key=danger_key,
+            threat_note=threat_note,
             draw_info=f"有效牌 {chosen.ukeire} 张" if chosen.ukeire is not None else "有效牌未知",
             melds_count=state.open_melds,
             alternatives=alternatives_list,
@@ -789,6 +790,7 @@ class MainWindow(QMainWindow):
             raw_detail=chosen.rationale,
             yaku_badge=yaku_badge,
             probability_label="Jev 选择概率" if advice.source == "jev" else "规则相对评分",
+            decision_available=True,
         )
 
         status_title = (
@@ -798,16 +800,9 @@ class MainWindow(QMainWindow):
         confidence_summary = f"置信 {advice.confidence:.0%}" if advice.confidence is not None else "未提供置信度"
         self.bottom_bar.set_status_info(
             status_title,
-            f"切 {rec_tile or chosen.label}  ·  {confidence_summary}  ·  防守倾向 {fold_rate}/100",
+            f"{chosen.label}  ·  {confidence_summary}  ·  {threat_note}  ·  危险 {danger_label}",
         )
         self.title_bar.set_status("对局中", "active")
-
-        if self.settings.logging_enabled:
-            append_decision_log({
-                "time": datetime.now(timezone.utc).isoformat(),
-                "state": state.to_dict(),
-                "advice": advice.to_dict(),
-            })
 
     def on_advice_failure(self, result: tuple[tuple[Any, ...], str]) -> None:
         self.advice_busy = False
@@ -816,10 +811,13 @@ class MainWindow(QMainWindow):
             self._start_latest_if_needed()
             return
         self.advised_identity = identity
-        self._current_chosen = None
+        self._explicit_request_identity = None
+        if self._simulation_identity == identity:
+            return
+        self._clear_current_decision()
         self.hero_card.update_decision(
             action_name="决策未就绪", rec_tile="", shanten_num=None, confidence=None,
-            probabilities=[], fold_rate=0, danger_score=0, draw_info="—",
+            probabilities=[], draw_info="—",
             melds_count=self.last_state.open_melds if self.last_state else 0,
             alternatives=[], source_note="在线模型请求失败",
             raw_detail=error.splitlines()[-1],
@@ -831,7 +829,8 @@ class MainWindow(QMainWindow):
         if (
             self.last_state is not None
             and self.last_state.identity() == self.pending_identity
-            and (self.manual or self.stable_count >= 2)
+            and (self.manual or self.stable_count >= 2
+                 or self._explicit_request_identity == self.pending_identity)
             and self.pending_identity != self.advised_identity
             and not self.advice_busy
         ):
@@ -840,12 +839,15 @@ class MainWindow(QMainWindow):
     def start_advice(self, state: GameState) -> None:
         if self.advice_busy:
             return
+        self._explicit_request_identity = None
         if not self.settings.api_key:
             self.advised_identity = state.identity()
-            self._current_chosen = None
+            if self._simulation_identity == state.identity():
+                return
+            self._clear_current_decision()
             self.hero_card.update_decision(
                 action_name="待连接", rec_tile="", shanten_num=None, confidence=None,
-                probabilities=[], fold_rate=0, danger_score=0, draw_info="—",
+                probabilities=[], draw_info="—",
                 melds_count=state.open_melds, alternatives=[],
                 source_note="等待 API Key",
                 raw_detail="牌局状态已准备好。请在模型设置填写 API Key 和请求地址，并测试连接。",
@@ -855,10 +857,8 @@ class MainWindow(QMainWindow):
             return
 
         self.advice_busy = True
-        self._current_chosen = None
-        self.hero_card.update_decision(action_name="请求中", rec_tile="", shanten_num=None,
-            confidence=None, probabilities=[], alternatives=[], source_note="等待真实模型响应",
-            raw_detail=f"模型：{self.settings.model_name}；单次超时 {self.settings.model_timeout:g} 秒，临时故障最多自动重试 2 次")
+        if self._simulation_identity != state.identity():
+            self._show_advice_pending()
         self._active_connection_revision = self._connection_revision
         self.active_advice_identity = state.identity()
         worker = AdviceWorker(state, self.settings.api_key, self.settings.connection())
@@ -866,13 +866,28 @@ class MainWindow(QMainWindow):
         worker.signals.failed.connect(self.on_advice_failure)
         self.pool.start(worker)
 
+    def _show_advice_pending(self) -> None:
+        self._clear_current_decision()
+        self.hero_card.update_decision(action_name="请求中", rec_tile="", shanten_num=None,
+            confidence=None, probabilities=[], alternatives=[], source_note="等待真实模型响应",
+            raw_detail=f"模型：{self.settings.model_name}；单次超时 {self.settings.model_timeout:g} 秒，临时故障最多自动重试 2 次")
+        self.bottom_bar.set_status_info("AI 建议请求中", "正在等待当前局面的建议")
+
     def _force_recompute_advice(self) -> None:
         if self._demo_preview:
             self.bottom_bar.set_status_info("等待真实牌局", "请先识别牌桌或手动核对，再请求 Jev 建议")
             return
         if self.last_state and self.last_state.hand:
+            if not self._comparison_state_available:
+                self.bottom_bar.set_status_info("暂时无法请求建议", "当前画面不可用，请等待识别恢复或手动核对牌面。")
+                return
+            self._simulation_identity = None
             self.advised_identity = None
             self.pending_identity = self.last_state.identity()
+            self._explicit_request_identity = self.pending_identity
+            if self.advice_busy:
+                self._show_advice_pending()
+                return
             self.start_advice(self.last_state)
         else:
             self.bottom_bar.set_status_info("等待真实牌局", "可在模型设置测试连接；实时建议需识别牌桌或手动核对牌面")
@@ -880,10 +895,11 @@ class MainWindow(QMainWindow):
     def clear_state(self) -> None:
         """Clears current hand and state to fresh."""
         self.pending_identity = None
+        self._explicit_request_identity = None
         self.advised_identity = None
         self.stable_count = 0
         self._demo_preview = False
-        self._current_chosen = None
+        self._clear_current_decision()
         empty_state = GameState.from_dict({
             "hand": [],
             "rivers": [[], [], [], []],
@@ -903,8 +919,6 @@ class MainWindow(QMainWindow):
             shanten_num=None,
             confidence=None,
             probabilities=[],
-            fold_rate=0,
-            danger_score=0.0,
             draw_info="无",
             melds_count=0,
             alternatives=[],
@@ -918,9 +932,10 @@ class MainWindow(QMainWindow):
         if self.running:
             self._capture_generation += 1
             self.pending_identity = None
+            self._explicit_request_identity = None
             self.advised_identity = None
             self.stable_count = 0
-            self._current_chosen = None
+            self._clear_current_decision()
             self.hero_card.update_decision(action_name="已暂停", rec_tile="", shanten_num=None,
                 confidence=None, probabilities=[], alternatives=[], source_note="实时建议已暂停",
                 raw_detail="点击【开始识别】恢复；暂停前的请求结果不会显示。")
@@ -931,61 +946,35 @@ class MainWindow(QMainWindow):
             self.bottom_bar.set_status_info("实时监测已暂停", "点击【开始识别】恢复后台监测")
             return
 
-        if self.settings.input_source == "browser" and self.hook.connected:
-            # A loopback ping proves only that the extension reached this app.
-            # Keep the calibrated screen reader available until the Hook has
-            # decoded an actual game state.
-            self._hook_active = self.hook.live_ready
-            self._begin_realtime("网页 Hook 已连接 · 正在等待真实牌局数据")
-            return
-
-        if self.manual and self.last_state and self.last_state.player_count == 3:
-            QMessageBox.information(self, "三人截图暂不支持", "三人局请继续手动核对；如需四人实时截图，请先在手动核对中改为四人麻将。")
-            return
-        if not self._update_steam_window():
-            return
-        if not self.settings.game_box:
-            QMessageBox.information(self, "请先选牌桌", "请点击右上角【桌】→【选择牌桌画面】框选雀魂。")
-            return
-
-        missing = [title for name, title, _, _, required in REGIONS if required and name not in self.settings.regions]
-        if missing:
-            frame = self._capture_without_overlay(self.settings.game_box)
-            detected = detect_basic_regions(frame)
-            if not all(name in detected for name in ("hand", "draw", "buttons")):
-                self.bottom_bar.set_status_info("自动校准失败", "请在【桌】→【基础区域校准】手动框选")
-                self.title_bar.set_status("待校准", "warning")
-                return
-            self.settings.regions.update(detected)
-            self.settings.save()
-            self.reader = VisionReader(self.settings.regions, self.templates)
-            self.bottom_bar.set_status_info("已自动定位牌面", "请核对一次当前手牌，随后将自动连续识别")
-            self.manual_state(training_frame=frame, force_resume=True)
-            return
-
-        if not self.templates.samples:
-            frame = self._capture_without_overlay(self.settings.game_box)
-            self.bottom_bar.set_status_info("首次识别学习", "请核对一次当前手牌，完成后自动连续监测")
-            self.manual_state(training_frame=frame, force_resume=True)
-            return
-
         if self._demo_preview:
             self.clear_state()
-        self._begin_realtime()
+
+        if self.settings.input_source == "steam":
+            if not self.steam.running:
+                self.steam.start()
+            self._hook_active = self.steam.live_ready
+            self._begin_realtime("Steam 实时协议监听中 · 牌局变化毫秒级自动请求 Jev")
+        else:
+            if self.hook._server is None:
+                self.hook.start()
+            self._hook_active = self.hook.live_ready
+            self._begin_realtime("网页 Hook 实时协议监听中 · 牌局变化毫秒级自动请求 Jev")
+
+        if self.last_state and self.last_state.hand and self._comparison_state_available:
+            self.pending_identity = self.last_state.identity()
+            self.stable_count = 2
+            if self.pending_identity != self.advised_identity and not self.advice_busy:
+                self.start_advice(self.last_state)
 
     def _begin_realtime(self, detail: str | None = None) -> None:
         self.manual = False
         self.running = True
+        self.timer.stop()
         self.bottom_bar.btn_toggle.setText("暂停识别")
         self.title_bar.set_status("实时监测中", "active")
         self.bottom_bar.set_status_info(
-            "实时监测运行中", detail or f"每 {self.settings.ui_interval_ms}ms 采集一次 · 牌局变化后自动请求 Jev"
+            "实时监测运行中", detail or "实时协议监听中 · 牌局变化后毫秒级自动请求 Jev"
         )
-        if self._hook_active:
-            self.timer.stop()
-        else:
-            self.timer.start()
-            self.capture_tick()
 
     def on_hook_status(self, message: str) -> None:
         if self.settings.input_source == "steam":
@@ -1001,16 +990,46 @@ class MainWindow(QMainWindow):
         else:
             self.bottom_bar.set_status_info(message, "网页 Hook 实时诊断")
 
+    def on_steam_status(self, message: str) -> None:
+        if self.settings.input_source != "steam":
+            return
+        if message.startswith("error:") or "通道异常" in message:
+            self._hook_active = False
+            self.on_capture_failure(message)
+            return
+        if message == "connected" or "协议已就绪" in message or "已捕获" in message:
+            self._hook_active = True
+        elif message == "disconnected":
+            self._hook_active = False
+        if not self.running:
+            self.title_bar.set_status("Steam 就绪", "active")
+            self.bottom_bar.set_status_info(message, "Steam 实时协议通道已准备")
+        else:
+            self.bottom_bar.set_status_info(message, "Steam 实时协议监听中")
+
     def on_hook_state(self, state: GameState) -> None:
         if self.settings.input_source == "steam":
             return
+        self._handle_protocol_state(state)
+
+    def on_steam_state(self, state: GameState) -> None:
+        if self.settings.input_source != "steam":
+            return
+        self._handle_protocol_state(state)
+
+    def _handle_protocol_state(self, state: GameState) -> None:
         self.last_state = state
         self._demo_preview = False
         self._render_state(state)
         if not self.running:
+            # Pausing automatic advice still permits an explicit request or
+            # local simulation. Duplicate Hook snapshots must not cancel it.
+            if state.identity() in (self.pending_identity, self._simulation_identity):
+                return
             self.pending_identity = None
+            self._explicit_request_identity = None
             self.advised_identity = None
-            self._current_chosen = None
+            self._clear_current_decision()
             self.hero_card.update_decision(action_name="已暂停", rec_tile="", shanten_num=None,
                 confidence=None, probabilities=[], alternatives=[], source_note="实时建议已暂停",
                 raw_detail="已收到新牌面，开始识别后生成当前局面的建议。")
@@ -1021,7 +1040,7 @@ class MainWindow(QMainWindow):
             self.timer.stop()
         identity = state.identity()
         if identity != self.pending_identity:
-            self._current_chosen = None
+            self._clear_current_decision()
             self.hero_card.update_decision(action_name="等待建议", rec_tile="", shanten_num=None,
                 confidence=None, probabilities=[], alternatives=[], source_note="牌局已更新",
                 raw_detail="正在处理最新局面")
@@ -1032,176 +1051,20 @@ class MainWindow(QMainWindow):
         self.advised_identity = None
         self.start_advice(state)
 
-    def capture_tick(self) -> None:
-        if not self.running or self.manual or self.capture_busy or not self.settings.game_box:
-            return
-        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton or QApplication.activeModalWidget():
-            return
-        if not self._update_steam_window():
-            return
-        game_rect = QRect(*self.settings.game_box)
-        comparison = self._comparison_dialog
-        if comparison is not None and comparison.isVisible() and capture_window_rect(comparison).intersects(game_rect):
-            self.on_capture_failure("切牌比较窗口遮挡了牌桌，请移开或关闭后继续识别")
-            return
-        if not self._capture_excluded and capture_window_rect(self).intersects(game_rect):
-            self.on_capture_failure("顾问窗口遮挡了牌桌，无法取得当前画面")
-            self.bottom_bar.set_status_info("窗口遮挡牌桌", "系统不支持排除悬浮窗，请把顾问窗口移到牌桌区域外")
-            return
-        self.capture_busy = True
-        worker = CaptureWorker(self.settings.game_box, self.reader, 0, self._capture_generation)
-        worker.signals.captured.connect(self._show_after_capture)
-        # Connect to QObject methods: lambda receivers can disappear with a finished runnable.
-        worker.signals.done.connect(self._on_capture_result)
-        worker.signals.failed.connect(self._on_capture_error)
-
-        self.pool.start(worker)
-
-    def _show_after_capture(self) -> None:
-        if self.capture_hidden:
-            self.capture_hidden = False
-            self.show()
-
     def on_capture_failure(self, error: str) -> None:
         self._comparison_state_available = False
         if self._comparison_dialog is not None:
             self._comparison_dialog.mark_current_state(None)
-        self._show_after_capture()
         self.capture_busy = False
         self.pending_identity = None
+        self._explicit_request_identity = None
         self.advised_identity = None
         self.stable_count = 0
-        self._current_chosen = None
+        self._clear_current_decision()
         self.hero_card.update_decision(action_name="采集异常", rec_tile="", shanten_num=None,
             confidence=None, probabilities=[], alternatives=[], source_note="画面不可用 · 暂停建议")
-        self.bottom_bar.set_status_info("画面采集异常", error.splitlines()[-1])
+        self.bottom_bar.set_status_info("实时通道异常", error.splitlines()[-1])
         self.title_bar.set_status("采集异常", "warning")
-
-    def on_observation(self, observation: Observation) -> None:
-        self.capture_busy = False
-        if not self.running or self.manual:
-            return
-
-        self.last_state = observation.state
-        self._demo_preview = False
-        if observation.state:
-            self._render_state(observation.state)
-        else:
-            if observation.debug.get("recognized_hand"):
-                self.hand_widget.set_hand(observation.debug["recognized_hand"])
-
-        if observation.problems or observation.state is None or observation.confidence < 0.90:
-            self._comparison_state_available = False
-            if self._comparison_dialog is not None:
-                self._comparison_dialog.mark_current_state(None)
-            self.pending_identity = None
-            self.advised_identity = None
-            self.stable_count = 0
-            self._current_chosen = None
-            self.hero_card.update_decision(action_name="待核对", rec_tile="", shanten_num=None,
-                confidence=None, probabilities=[], alternatives=[], source_note="识别不确定 · 暂停建议",
-                raw_detail="；".join(observation.problems) or "识别置信度不足")
-            self.title_bar.set_status("核对中", "warning")
-            self.bottom_bar.set_status_info("识别待核对", "；".join(observation.problems) or "置信度不足")
-            return
-
-        identity = observation.state.identity()
-        if identity == self.pending_identity:
-            self.stable_count += 1
-        else:
-            self.pending_identity = identity
-            self.stable_count = 1
-            self.advised_identity = None
-            self._current_chosen = None
-            self.hero_card.update_decision(action_name="确认牌面", rec_tile="", shanten_num=None,
-                confidence=None, probabilities=[], alternatives=[], source_note="牌面已变化 · 等待稳定识别",
-                raw_detail="连续两次识别一致后，再生成新建议。")
-
-        if self.stable_count >= 2 and identity != self.advised_identity and not self.advice_busy:
-            self.start_advice(observation.state)
-
-    def _capture_without_overlay(self, box: tuple[int, int, int, int] | None = None):
-        was_visible = self.isVisible()
-        self.hide()
-        QApplication.processEvents()
-        time.sleep(0.2)
-        try:
-            return capture_box(box) if box else capture_desktop()
-        finally:
-            if was_visible:
-                self.show()
-
-    def select_game(self) -> None:
-        self.running = False
-        self.timer.stop()
-        self.bottom_bar.btn_toggle.setText("开始识别")
-        image, origin = self._capture_without_overlay()
-        dialog = RegionDialog(image, "Steam 雀魂游戏画面" if self.settings.input_source == "steam" else "雀魂浏览器游戏画面", parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        chosen = dialog.selected_original()
-        if not chosen:
-            return
-        x, y, width, height = chosen
-        self._steam_window = None
-        self._bind_capture_box((x + origin[0], y + origin[1], width, height))
-
-    def calibrate(self, full: bool = False) -> None:
-        if not self._update_steam_window():
-            return
-        if not self.settings.game_box:
-            QMessageBox.information(self, "先选牌桌", "请先框选雀魂游戏画面。")
-            return
-        self.running = False
-        self.timer.stop()
-        frame = self._capture_without_overlay(self.settings.game_box)
-        regions = dict(self.settings.regions)
-        selected_regions = (
-            tuple(row for row in REGIONS if not row[4] or row[0] not in regions)
-            if full else tuple(row for row in REGIONS if row[4])
-        )
-        for name, title, _, _, required in selected_regions:
-            dialog = RegionDialog(frame, title, optional=not required, parent=self)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                if required and name not in regions:
-                    QMessageBox.information(self, "校准未完成", f"必需区域 {title} 未框选。")
-                    return
-                continue
-            box = dialog.selected_original()
-            if not box:
-                continue
-            x, y, w, h = box
-            regions[name] = (x / frame.shape[1], y / frame.shape[0], w / frame.shape[1], h / frame.shape[0])
-        self._capture_generation += 1
-        self.settings.regions = regions
-        self.settings.save()
-        self.reader = VisionReader(regions, self.templates)
-        self.bottom_bar.set_status_info("校准已保存", "可继续标注样本或开启实时识别。")
-
-    def label_templates(self) -> None:
-        if not self._update_steam_window():
-            return
-        if not self.settings.game_box or not self.settings.regions:
-            QMessageBox.information(self, "先校准", "请先选择牌桌并校准区域。")
-            return
-        frame = self._capture_without_overlay(self.settings.game_box)
-        dialog = TemplateDialog(frame, self.settings, self.templates, self)
-        dialog.exec()
-        self.bottom_bar.set_status_info("样本库已更新", f"当前共有 {len(self.templates.samples)} 个样本。")
-
-    def save_frame(self) -> None:
-        if not self._update_steam_window():
-            return
-        if not self.settings.game_box:
-            QMessageBox.information(self, "先选牌桌", "请先选择牌桌。")
-            return
-        frame = self._capture_without_overlay(self.settings.game_box)
-        directory = config_dir() / "frames"
-        directory.mkdir(parents=True, exist_ok=True)
-        filename = datetime.now().strftime("frame-%Y%m%d-%H%M%S-%f.png")
-        path = directory / filename
-        cv2.imwrite(str(path), frame)
-        self.bottom_bar.set_status_info("截图已保存", str(path.name))
 
     def edit_jev_settings(self) -> None:
         dialog = JevSettingsDialog(self.settings, self)
@@ -1242,6 +1105,7 @@ class MainWindow(QMainWindow):
             dialog = DiscardComparisonDialog(state, options, self)
             self._comparison_dialog = dialog
             dialog.refresh_requested.connect(self.show_discard_comparison)
+            dialog.simulate_requested.connect(self._simulate_comparison_discard)
             dialog.finished.connect(self._close_comparison)
         else:
             self._comparison_dialog.set_snapshot(state, options)
@@ -1250,6 +1114,15 @@ class MainWindow(QMainWindow):
         self._comparison_dialog.show()
         self._comparison_dialog.raise_()
         self._comparison_dialog.activateWindow()
+
+    def _simulate_comparison_discard(self, snapshot_identity: tuple[Any, ...], tile: str) -> None:
+        state = self.last_state
+        if not self._comparison_state_available or state is None or state.identity() != snapshot_identity:
+            if self._comparison_dialog is not None:
+                self._comparison_dialog.mark_current_state(state if self._comparison_state_available else None)
+                self._comparison_dialog.feedback_label.setText("牌面已变化或不可用，请先刷新局面再模拟")
+            return
+        self.on_hand_tile_clicked(tile)
 
     def _close_comparison(self, result: int) -> None:
         dialog = self._comparison_dialog
@@ -1290,71 +1163,46 @@ class MainWindow(QMainWindow):
         """Interactive simulation when user clicks a tile in their hand or alternative badges."""
         if not self.last_state or not self.last_state.hand or tile not in self.last_state.hand:
             return
-        rest = list(self.last_state.hand)
-        rest.remove(tile)
-        after = tuple(rest)
-        s = shanten(after, self.last_state.open_melds)
-        u, imp_tiles = ukeire_details(after, self.last_state)
-        d = danger(tile, self.last_state)
-        dora = dora_value(tile, self.last_state)
-
-        if imp_tiles:
-            preview_str = " ".join(imp_tiles[:6]) + (f" 等{len(imp_tiles)}种" if len(imp_tiles) > 6 else "")
-            wait_desc = f"{'待牌' if s == 0 else '进张'} {preview_str} 约 {u} 张"
-        else:
-            wait_desc = f"有效牌约 {u} 张"
-
-        sim_candidate = Candidate(
-            "discard", tile, f"模拟打 {tile}",
-            f"{shanten_text(s)} · {wait_desc} · 危险级 {d} · 弃宝牌 {dora} 张 · {yaku_hints(self.last_state)}",
-            s, u, d, dora,
-            improving_tiles=imp_tiles,
-        )
+        if not self._comparison_state_available:
+            self.bottom_bar.set_status_info("暂时无法模拟", "当前画面不可用，请等待识别恢复或手动核对牌面。")
+            return
+        try:
+            base = discard_candidate(self.last_state, tile)
+        except (ValueError, NoDecision, UncertainState) as error:
+            self.bottom_bar.set_status_info("暂时无法模拟", str(error))
+            return
+        sim_candidate = replace(base, label=f"模拟打 {tile}")
         self._current_chosen = sim_candidate
+        self._simulation_identity = self.last_state.identity()
         self.hand_widget.set_hand(self.last_state.hand, highlight_tile=tile)
-        fold_rate, danger_score, _ = self._calculate_metrics(self.last_state, sim_candidate)
+        danger_label, danger_key, threat_note = self._danger_metrics(self.last_state, sim_candidate)
 
         self.hero_card.update_decision(
             action_name="模拟切牌",
             rec_tile=tile,
-            shanten_num=s,
+            shanten_num=sim_candidate.shanten,
             confidence=None,
             probabilities=[],
-            fold_rate=fold_rate,
-            danger_score=danger_score,
+            danger_label=danger_label,
+            danger_key=danger_key,
+            threat_note=threat_note,
             draw_info="手动模拟",
             melds_count=self.last_state.open_melds,
             alternatives=[],
             source_note="手动模拟 · 点击【AI建议】恢复推荐",
             raw_detail=sim_candidate.rationale,
         )
-        self.bottom_bar.set_status_info("手动模拟切牌", f"切 {tile}  ·  {shanten_text(s)}  ·  进张约 {u} 张  ·  危险级 {d}")
+        self.bottom_bar.set_status_info(
+            "手动模拟切牌",
+            f"切 {tile}  ·  {shanten_text(sim_candidate.shanten)}  ·  进张约 {sim_candidate.ukeire} 张  ·  危险 {danger_label}",
+        )
 
-    def manual_state(self, training_frame: np.ndarray | None = None, force_resume: bool = False) -> None:
-        if training_frame is None and self.settings.game_box:
-            try:
-                if self._update_steam_window():
-                    training_frame = self._capture_without_overlay(self.settings.game_box)
-            except Exception:
-                training_frame = None
-        if training_frame is not None and not all(
-                name in self.settings.regions for name in ("hand", "draw", "buttons")):
-            detected = detect_basic_regions(training_frame)
-            if detected:
-                self.settings.regions.update(detected)
-                self.settings.save()
-                self.reader = VisionReader(self.settings.regions, self.templates)
+    def manual_state(self, force_resume: bool = False) -> None:
         dialog = ManualStateDialog(self.last_state, self)
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.state is None:
             return
         self._capture_generation += 1
-        resume = (force_resume or dialog.learn_and_resume.isChecked()) and dialog.state.player_count == 4
-        # Three-player screenshots are not calibrated by this reader. Keep manual states manual.
-        learned = 0
-        if resume and training_frame is not None:
-            learned = learn_templates_from_state(
-                training_frame, self.settings.regions, dialog.state, self.templates
-            )
+        resume = force_resume or dialog.learn_and_resume.isChecked()
         self.manual = not resume
         self.running = False
         self.timer.stop()
@@ -1368,7 +1216,7 @@ class MainWindow(QMainWindow):
         self.bottom_bar.set_status_info("手动状态", "已加载手动输入的局面")
         self._start_latest_if_needed()
         if resume:
-            self._begin_realtime(f"已学习 {learned} 个当前牌面样本 · 后续变化自动识别")
+            self._begin_realtime("已应用手动局面 · 后续协议事件将自动同步")
 
     def closeEvent(self, event: Any) -> None:
         if self._comparison_dialog is not None:
@@ -1384,6 +1232,7 @@ class MainWindow(QMainWindow):
         self.running = False
         self.pool.waitForDone(1000)
         self.hook.stop()
+        self.steam.stop()
         super().closeEvent(event)
 
 

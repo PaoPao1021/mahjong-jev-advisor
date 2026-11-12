@@ -31,3 +31,55 @@ def test_comparison_rejects_uncertain_state():
     state = GameState.from_dict({'hand': '123m456p789s123z55m', 'observation_confidence': 0.5})
     with pytest.raises(UncertainState):
         discard_comparison(state)
+
+
+def test_comparison_and_simulation_reuse_analysis_but_refresh_changed_state(monkeypatch):
+    from dataclasses import replace
+    from mahjong_jev_advisor import rules
+
+    rules.discard_candidate.cache_clear()
+    rules.discard_comparison.cache_clear()
+    original = rules.ukeire_details
+    calls = []
+
+    def counted_ukeire(hand, state):
+        calls.append(state)
+        return original(hand, state)
+
+    monkeypatch.setattr(rules, "ukeire_details", counted_ukeire)
+    state = GameState.from_dict({
+        "hand": "123m405p789s123z55m", "riichi": [False] * 4,
+    })
+    try:
+        rows = rules.discard_comparison(state)
+        first_calls = len(calls)
+        assert first_calls == len(set(state.hand))
+        assert rules.discard_comparison(replace(state)) == rows
+        for row in rows:
+            assert rules.discard_candidate(state, row.tile) == row
+        assert len(calls) == first_calls
+
+        threatened = replace(state, riichi=(False, True, False, False))
+        updated = rules.discard_candidate(threatened, "4p")
+        assert len(calls) == first_calls + 1
+        assert updated.danger > rules.discard_candidate(state, "4p").danger
+
+        # Confidence is deliberately absent from GameState.identity(), but
+        # must still invalidate a previously trusted cached calculation.
+        uncertain = replace(state, observation_confidence=0.5)
+        assert uncertain.identity() == state.identity()
+        with pytest.raises(UncertainState):
+            rules.discard_comparison(uncertain)
+        with pytest.raises(UncertainState):
+            rules.discard_candidate(uncertain, "4p")
+    finally:
+        rules.discard_candidate.cache_clear()
+        rules.discard_comparison.cache_clear()
+
+
+def test_single_discard_requires_drawn_hand():
+    from mahjong_jev_advisor.rules import discard_candidate
+
+    state = GameState.from_dict({"hand": "123m456p789s123z5m"})
+    with pytest.raises(NoDecision):
+        discard_candidate(state, "1m")

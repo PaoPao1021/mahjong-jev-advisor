@@ -1,8 +1,8 @@
 """Dialogs and utility windows for Mahjong Jev Advisor.
 
 Contains:
-- SelectionCanvas & RegionDialog for table/region calibrations
-- TemplateDialog for labeling mahjong tiles
+- DiscardComparisonDialog for local tile efficiency and danger comparison
+- SteamConnectionDialog for Steam real-time Liqi WebSocket capture & certificate setup
 - JevSettingsDialog & LLMSettingsDialog
 - ManualStateDialog for manual verification and rapid tile input
 - LLMAnalysisDialog for deep AI tactical commentary
@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import json
 from typing import Any
-import cv2
-import numpy as np
-from PySide6.QtCore import QObject, QPoint, QRect, QRunnable, QThreadPool, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QObject, QRect, QRunnable, QThreadPool, Qt, Signal
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
@@ -23,16 +21,19 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QApplication,
 )
 
+from .hook import HOOK_PORT
 from .settings import Settings
 from .state import Candidate, GameState
-from .vision import REGIONS, TEMPLATE_LABELS, TemplateStore, parse_buttons, region_cells
-
-
-def pixmap_from_bgr(image: np.ndarray) -> QPixmap:
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-    qimage = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimage.copy())
+from .steam_capture import (
+    DEFAULT_STEAM_PROCESS,
+    detect_steam_game_processes,
+    generate_clash_rules,
+    generate_surge_rules,
+    install_mitm_cert,
+    is_mitm_cert_installed,
+    mitm_cert_path,
+)
+from .tiles import parse_buttons
 
 
 def make_dialog_header(title: str, subtitle: str, badge_text: str | None = None) -> QFrame:
@@ -70,6 +71,7 @@ def make_dialog_header(title: str, subtitle: str, badge_text: str | None = None)
 class DiscardComparisonDialog(QDialog):
     """Non-modal, refreshable comparison with an explicit immutable snapshot."""
     refresh_requested = Signal()
+    simulate_requested = Signal(object, str)
 
     def __init__(self, state: GameState, options: tuple[Candidate, ...], parent=None):
         super().__init__(parent)
@@ -79,7 +81,7 @@ class DiscardComparisonDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
-        layout.addWidget(make_dialog_header("比较每一种切法", "点击列标题排序，选择一行查看完整牌理。", "本地分析"))
+        layout.addWidget(make_dialog_header("比较每一种切法", "点击列标题排序，选择一行查看牌理；双击或按 Enter 模拟该切法。", "本地分析"))
         self.snapshot_label = QLabel()
         self.snapshot_label.setWordWrap(True)
         layout.addWidget(self.snapshot_label)
@@ -113,13 +115,15 @@ class DiscardComparisonDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._show_detail)
+        self.table.itemDoubleClicked.connect(self.simulate_selected)
+        self.table.installEventFilter(self)
         layout.addWidget(self.table, 1)
         self.detail_label = QLabel("选择一行查看牌理")
         self.detail_label.setWordWrap(True)
         self.detail_label.setMinimumHeight(42)
         self.detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.detail_label)
-        note = QLabel("0 向听 = 听牌。进张按可见牌估算，危险级为相对指标；操作限制请以游戏为准。")
+        note = QLabel("0 向听 = 听牌。进张按可见牌估算，危险级仅评估已知立直对手；无人立直或信息不全时显示 —。操作限制请以游戏为准。")
         note.setWordWrap(True)
         layout.addWidget(note)
         self.feedback_label = QLabel("无需 API Key · 不会在游戏中执行操作")
@@ -131,47 +135,111 @@ class DiscardComparisonDialog(QDialog):
         self.refresh_button.setShortcut("Ctrl+R")
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         buttons.addWidget(self.refresh_button)
+        self.simulate_button = QPushButton("模拟切牌")
+        self.simulate_button.setToolTip("在主窗口模拟选中的切法（Enter），不会在游戏中出牌")
+        self.simulate_button.setShortcut("Return")
+        self.simulate_button.clicked.connect(self.simulate_selected)
+        buttons.addWidget(self.simulate_button)
         self.copy_button = QPushButton("复制比较表")
+        self.copy_button.setToolTip("复制全部比较结果（Ctrl+C）")
+        self.copy_button.setShortcut("Ctrl+C")
         self.copy_button.clicked.connect(self.copy_table)
         buttons.addWidget(self.copy_button)
         buttons.addStretch()
         self.close_button = QPushButton("关闭")
         self.close_button.clicked.connect(self.accept)
         buttons.addWidget(self.close_button)
-        for button in (self.refresh_button, self.copy_button, self.close_button):
+        for button in (self.refresh_button, self.simulate_button, self.copy_button, self.close_button):
             button.setAutoDefault(False)
             button.setMinimumHeight(32)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
         layout.addLayout(buttons)
         self.set_snapshot(state, options)
-        screen = parent.screen() if parent is not None else QApplication.primaryScreen()
+        # Obtain the application-owned screen directly. QWidget.screen() can
+        # tie its Python wrapper to the parent window's lifetime in PySide.
+        screen = QApplication.screenAt(parent.frameGeometry().center()) if parent is not None else None
+        screen = screen or QApplication.primaryScreen()
         available = screen.availableGeometry() if screen else QRect(0, 0, 800, 650)
         self.resize(min(780, max(400, available.width() - 32)), min(600, max(380, available.height() - 64)))
 
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.table and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
+            simulate = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and event.modifiers() in (
+                Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.KeypadModifier,
+            )
+            copy = event.matches(QKeySequence.StandardKey.Copy) or (
+                event.key() == Qt.Key.Key_C and event.modifiers() == Qt.KeyboardModifier.ControlModifier
+            )
+            if simulate or copy:
+                event.accept()
+                if event.type() == QEvent.Type.KeyPress:
+                    self.simulate_selected() if simulate else self.copy_table()
+                return True
+        return super().eventFilter(watched, event)
+
     def set_snapshot(self, state: GameState, options: tuple[Candidate, ...]) -> None:
+        header = self.table.horizontalHeader()
+        sort_column = header.sortIndicatorSection() if self.table.isSortingEnabled() else -1
+        sort_order = header.sortIndicatorOrder()
+        current_row = self.table.currentRow()
+        selected_item = self.table.item(current_row, 0) if current_row >= 0 else None
+        selected_tile = selected_item.text() if selected_item is not None else None
         self.snapshot_identity = state.identity()
         self.snapshot_label.setText(f"{state.player_count}人麻将 · 手牌：{' '.join(state.hand)}")
         self.table.setSortingEnabled(False)
         self.table.clearContents()
         self.table.setRowCount(len(options))
+        opponents = [r for i, r in enumerate(state.riichi) if i != state.seat]
+        danger_available = any(opponents) and all(r is not None for r in opponents)
         for row, candidate in enumerate(options):
-            values = [candidate.tile, candidate.shanten, candidate.ukeire, candidate.danger,
+            values = [candidate.tile, candidate.shanten, candidate.ukeire,
+                      candidate.danger if danger_available else None,
                       candidate.dora_loss, " ".join(candidate.improving_tiles) or "—"]
             for column, value in enumerate(values):
                 item = QTableWidgetItem()
                 item.setData(Qt.ItemDataRole.DisplayRole, value if value is not None else "—")
                 item.setData(Qt.ItemDataRole.UserRole, candidate.rationale)
                 item.setToolTip(candidate.rationale)
+                if value is not None:
+                    self._colorize(item, column, value)
                 self.table.setItem(row, column, item)
-        self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        header.setSortIndicator(sort_column, sort_order)
         self.table.setSortingEnabled(True)
         self.mark_current_state(state)
         self.feedback_label.setText(f"已载入 {len(options)} 种切法 · 本地分析")
         if options:
-            self.table.selectRow(0)
+            selected_row = next((row for row in range(len(options))
+                                 if self.table.item(row, 0).text() == selected_tile), 0)
+            self.table.selectRow(selected_row)
+            self._show_detail()
+        else:
+            self.detail_label.setText("当前没有可比较的切法")
+
+    @staticmethod
+    def _colorize(item: QTableWidgetItem, column: int, value: Any) -> None:
+        """Band colors matching the hero card: shanten by progress, danger by risk."""
+        from PySide6.QtGui import QBrush, QColor
+        if column == 1 and isinstance(value, int):
+            colors = {0: QColor(253, 224, 71), 1: QColor(56, 189, 248)}
+            if value in colors:
+                item.setForeground(QBrush(colors[value]))
+        elif column == 3 and isinstance(value, int):
+            if value <= 0:
+                color = QColor(110, 231, 183)
+            elif value == 1:
+                color = QColor(125, 211, 252)
+            elif value <= 3:
+                color = QColor(252, 211, 77)
+            elif value == 4:
+                color = QColor(253, 186, 116)
+            else:
+                color = QColor(252, 165, 165)
+            item.setForeground(QBrush(color))
 
     def mark_current_state(self, state: GameState | None) -> None:
         fresh = state is not None and state.identity() == self.snapshot_identity
+        self._snapshot_current = fresh
+        self.simulate_button.setEnabled(fresh and self.table.rowCount() > 0)
         if state is None:
             message = "当前画面不可用 · 下表保留旧快照，待识别恢复后刷新"
         elif fresh:
@@ -185,6 +253,15 @@ class DiscardComparisonDialog(QDialog):
         selected = self.table.selectedItems()
         self.detail_label.setText(selected[0].data(Qt.ItemDataRole.UserRole) if selected else "选择一行查看牌理")
 
+    def simulate_selected(self) -> None:
+        if not self._snapshot_current:
+            self.feedback_label.setText("当前快照不可用于模拟，请先恢复识别并刷新局面")
+            return
+        row = self.table.currentRow()
+        if row >= 0:
+            tile = self.table.item(row, 0).text()
+            self.simulate_requested.emit(self.snapshot_identity, tile)
+
     def copy_table(self) -> None:
         rows = ["\t".join(self.headers)]
         for row in range(self.table.rowCount()):
@@ -193,245 +270,188 @@ class DiscardComparisonDialog(QDialog):
         self.feedback_label.setText(f"已复制 {self.table.rowCount()} 种切法，可粘贴到表格或聊天中")
 
 
-class SelectionCanvas(QWidget):
-    """Interactive screen calibration canvas with high-tech tactical reticle."""
+class SteamConnectionDialog(QDialog):
+    """Configuration and one-click setup dialog for Steam Mahjong Soul Liqi capture."""
 
-    def __init__(self, image: np.ndarray, parent: QWidget | None = None):
+    def __init__(self, settings: Settings, diagnostic: dict[str, Any] | None = None, parent: QWidget | None = None):
         super().__init__(parent)
-        self.image = image
-        self.pixmap = pixmap_from_bgr(image)
-        self.setFixedSize(self.pixmap.size())
-        self.start: QPoint | None = None
-        self.end: QPoint | None = None
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.start = event.position().toPoint()
-            self.end = self.start
-            self.update()
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self.start is not None:
-            self.end = event.position().toPoint()
-            self.update()
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self.start is not None:
-            self.end = event.position().toPoint()
-            self.update()
-
-    def paintEvent(self, event: Any) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(0, 0, self.pixmap)
-
-        if self.start is not None and self.end is not None:
-            rect = QRect(self.start, self.end).normalized()
-            # 1. Darken exterior unselected areas for focus
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(0, 0, 0, 110))
-            if rect.top() > 0:
-                painter.drawRect(0, 0, self.width(), rect.top())
-            if rect.bottom() < self.height():
-                painter.drawRect(0, rect.bottom() + 1, self.width(), self.height() - rect.bottom() - 1)
-            painter.drawRect(0, rect.top(), rect.left(), rect.height() + 1)
-            painter.drawRect(rect.right() + 1, rect.top(), self.width() - rect.right() - 1, rect.height() + 1)
-
-            # 2. Glowing target interior
-            painter.setBrush(QColor(56, 189, 248, 25))
-            painter.drawRect(rect)
-
-            # 3. Main reticle border
-            painter.setPen(QPen(QColor(56, 189, 248, 220), 1.5))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(rect)
-
-            # 4. Tactical corner brackets (emerald luminous)
-            bracket_len = min(14, rect.width() // 3, rect.height() // 3)
-            if bracket_len >= 4:
-                painter.setPen(QPen(QColor(52, 211, 153), 2.5))
-                # Top-Left
-                painter.drawLine(rect.left(), rect.top(), rect.left() + bracket_len, rect.top())
-                painter.drawLine(rect.left(), rect.top(), rect.left(), rect.top() + bracket_len)
-                # Top-Right
-                painter.drawLine(rect.right(), rect.top(), rect.right() - bracket_len, rect.top())
-                painter.drawLine(rect.right(), rect.top(), rect.right(), rect.top() + bracket_len)
-                # Bottom-Left
-                painter.drawLine(rect.left(), rect.bottom(), rect.left() + bracket_len, rect.bottom())
-                painter.drawLine(rect.left(), rect.bottom(), rect.left(), rect.bottom() - bracket_len)
-                # Bottom-Right
-                painter.drawLine(rect.right(), rect.bottom(), rect.right() - bracket_len, rect.bottom())
-                painter.drawLine(rect.right(), rect.bottom(), rect.right(), rect.bottom() - bracket_len)
-
-            # 5. Dimension pill badge
-            w, h = rect.width(), rect.height()
-            dim_str = f" {w} × {h} px "
-            font = QFont("Segoe UI", 9)
-            font.setBold(True)
-            painter.setFont(font)
-            metrics = painter.fontMetrics()
-            tw = metrics.horizontalAdvance(dim_str) + 8
-            th = metrics.height() + 4
-            bx = rect.right() - tw
-            by = rect.bottom() + 6
-            if by + th > self.height():
-                by = rect.top() - th - 6
-            if bx < 0:
-                bx = rect.left()
-            painter.setPen(QPen(QColor(56, 189, 248, 180), 1))
-            painter.setBrush(QColor(10, 15, 26, 220))
-            painter.drawRoundedRect(bx, by, tw, th, 4, 4)
-            painter.setPen(QColor(224, 242, 254))
-            painter.drawText(bx, by, tw, th, Qt.AlignmentFlag.AlignCenter, dim_str)
-
-    def selected(self) -> tuple[int, int, int, int] | None:
-        if self.start is None or self.end is None:
-            return None
-        rect = QRect(self.start, self.end).normalized()
-        if rect.width() < 8 or rect.height() < 8:
-            return None
-        return rect.x(), rect.y(), rect.width(), rect.height()
-
-
-class RegionDialog(QDialog):
-    def __init__(self, image: np.ndarray, title: str, optional: bool = False, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-
-        banner = make_dialog_header(
-            title=f"区域校准 · {title}",
-            subtitle="按住鼠标左键在画面中拖拽框选，完成后点击“确定保存”",
-            badge_text="视觉标定",
-        )
-        layout.addWidget(banner)
-
-        self.scale = min(1.0, 1250 / image.shape[1], 740 / image.shape[0])
-        display = cv2.resize(image, None, fx=self.scale, fy=self.scale) if self.scale < 1 else image
-        self.canvas = SelectionCanvas(display)
-        scroll = QScrollArea()
-        scroll.setWidget(self.canvas)
-        scroll.setWidgetResizable(False)
-        layout.addWidget(scroll, 1)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定保存")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self._accept_if_selected)
-        buttons.rejected.connect(self.reject)
-        if optional:
-            skip = buttons.addButton("跳过", QDialogButtonBox.ButtonRole.ActionRole)
-            skip.clicked.connect(self.reject)
-        layout.addWidget(buttons)
-        self.resize(min(display.shape[1] + 40, 1300), min(display.shape[0] + 130, 840))
-
-    def _accept_if_selected(self) -> None:
-        if not self.canvas.selected():
-            QMessageBox.information(self, "请框选", "请先在画面上拖动，框选对应区域。")
-            return
-        self.accept()
-
-    def selected_original(self) -> tuple[int, int, int, int] | None:
-        box = self.canvas.selected()
-        if box is None:
-            return None
-        return tuple(round(value / self.scale) for value in box)
-
-
-class TemplateDialog(QDialog):
-    def __init__(self, frame: np.ndarray, settings: Settings, store: TemplateStore, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setWindowTitle("标注牌面样本")
-        self.store = store
-        self.rows: list[tuple[QComboBox, np.ndarray]] = []
+        self.setWindowTitle("Steam 雀魂实时连接与证书设置")
+        self._diagnostic = diagnostic or {}
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
 
         banner = make_dialog_header(
-            title="标注牌面样本与模板库校准",
-            subtitle="为未识别的牌面或空白格标注标签，系统将自动增量学习并持久化模板",
-            badge_text="增量学习",
+            title="Steam 雀魂 · 毫秒级只读协议直连配置",
+            subtitle="不截图、不改包、不注入内存，直接解码雀魂 Liqi WebSocket 协议流（完美支持四人/三人麻将）",
+            badge_text="STEAM 实时引擎",
         )
         root.addWidget(banner)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(8, 8, 8, 8)
-        body_layout.setSpacing(6)
-        count = 0
-        template_regions = sorted(
-            REGIONS,
-            key=lambda item: {"hand": 0, "draw": 1, "dora": 2}.get(item[0], 3),
-        )
-        for name, title, cols, rows, _ in template_regions:
-            if name not in settings.regions or name.startswith(("score", "riichi")) or name in ("buttons", "round"):
-                continue
-            for number, cell in enumerate(region_cells(frame, settings.regions[name], cols, rows)):
-                if cell.size == 0:
-                    continue
-                matched = store.match(cell)
-                if matched.label and matched.confidence >= 0.94:
-                    continue
+        card1 = QFrame()
+        card1.setObjectName("dialogSectionCard")
+        form1 = QFormLayout(card1)
+        form1.setSpacing(10)
+        form1.setContentsMargins(12, 10, 12, 10)
 
-                row_card = QFrame()
-                row_card.setObjectName("tileSampleCard")
-                row_card.setStyleSheet(
-                    "QFrame#tileSampleCard { background: rgba(18, 25, 41, 0.7); "
-                    "border: 1px solid rgba(56, 72, 100, 0.45); border-radius: 6px; padding: 4px; }"
-                )
-                line = QHBoxLayout(row_card)
-                line.setContentsMargins(8, 4, 8, 4)
-                line.setSpacing(10)
+        lbl_sec1 = QLabel("● 捕获模式与进程/端口参数")
+        lbl_sec1.setObjectName("dialogSectionTitle")
+        form1.addRow(lbl_sec1)
 
-                lbl = QLabel(f"{title} #{number + 1}")
-                lbl.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600; min-width: 80px;")
-                line.addWidget(lbl)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("进程直连模式 (local:Jantama_MahjongSoul · 零代理配置，推荐)", "process")
+        self.mode_combo.addItem("本地只读代理 (127.0.0.1:端口 · 免管理员，支持 PAC / 启动项 / Clash)", "proxy")
+        self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(settings.steam_capture_mode)))
+        form1.addRow("捕获方式", self.mode_combo)
 
-                preview = QLabel()
-                preview.setStyleSheet("border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 4px; background: #060911;")
-                preview.setPixmap(pixmap_from_bgr(cell).scaled(42, 56, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-                line.addWidget(preview)
+        proc_row = QHBoxLayout()
+        self.process_name = QLineEdit(settings.steam_process_name or DEFAULT_STEAM_PROCESS)
+        self.process_name.setPlaceholderText("默认 Jantama_MahjongSoul")
+        proc_row.addWidget(self.process_name, 1)
+        self.scan_btn = QPushButton("扫描运行中雀魂")
+        self.scan_btn.clicked.connect(self._scan_processes)
+        proc_row.addWidget(self.scan_btn)
+        form1.addRow("目标进程名", proc_row)
 
-                choice = QComboBox()
-                choice.addItems(["跳过"] + list(TEMPLATE_LABELS))
-                if matched.label:
-                    choice.setCurrentText(matched.label)
-                line.addWidget(choice, 1)
+        self.proxy_port = QSpinBox()
+        self.proxy_port.setRange(1024, 65535)
+        self.proxy_port.setValue(int(settings.steam_proxy_port or 10999))
+        form1.addRow("本地代理端口", self.proxy_port)
 
-                body_layout.addWidget(row_card)
-                self.rows.append((choice, cell))
-                count += 1
-                if count >= 100:
-                    break
-            if count >= 100:
-                break
-        body_layout.addStretch()
-        scroll.setWidget(body)
-        root.addWidget(scroll, 1)
+        self.upstream_proxy = QLineEdit(settings.steam_upstream_proxy)
+        self.upstream_proxy.setPlaceholderText("可选，如 http://127.0.0.1:7890（若使用加速器/梯子时填写）")
+        form1.addRow("上游代理链", self.upstream_proxy)
+
+        root.addWidget(card1)
+
+        card2 = QFrame()
+        card2.setObjectName("dialogSectionCard")
+        v2 = QVBoxLayout(card2)
+        v2.setContentsMargins(12, 10, 12, 10)
+        v2.setSpacing(8)
+
+        lbl_sec2 = QLabel("● 本地 TLS 证书信任与一键分流工具")
+        lbl_sec2.setObjectName("dialogSectionTitle")
+        v2.addWidget(lbl_sec2)
+
+        cert_row = QHBoxLayout()
+        self.cert_status_label = QLabel()
+        self.cert_status_label.setWordWrap(True)
+        cert_row.addWidget(self.cert_status_label, 1)
+        self.install_cert_btn = QPushButton("一键安装 / 信任本地 CA 证书")
+        self.install_cert_btn.clicked.connect(self._install_cert)
+        cert_row.addWidget(self.install_cert_btn)
+        v2.addLayout(cert_row)
+
+        copy_row = QHBoxLayout()
+        self.copy_pac_btn = QPushButton("复制系统 PAC 地址")
+        self.copy_pac_btn.clicked.connect(self._copy_pac_url)
+        copy_row.addWidget(self.copy_pac_btn)
+
+        self.copy_launch_btn = QPushButton("复制 Steam 启动项")
+        self.copy_launch_btn.clicked.connect(self._copy_steam_launch_arg)
+        copy_row.addWidget(self.copy_launch_btn)
+
+        self.copy_clash_btn = QPushButton("复制 Clash 分流规则")
+        self.copy_clash_btn.clicked.connect(self._copy_clash_rules)
+        copy_row.addWidget(self.copy_clash_btn)
+        v2.addLayout(copy_row)
+
+        root.addWidget(card2)
+
+        self.output = QTextEdit()
+        self.output.setObjectName("terminalOutput")
+        self.output.setReadOnly(True)
+        self.output.setMinimumHeight(140)
+        root.addWidget(self.output, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存样本")
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存并应用")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self._save)
+        buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
-        self.resize(520, 680)
 
-    def _save(self) -> None:
-        saved = 0
-        for choice, cell in self.rows:
-            label = choice.currentText()
-            if label != "跳过":
-                self.store.add(label, cell)
-                saved += 1
-        QMessageBox.information(self, "样本已保存", f"保存了 {saved} 个牌面样本。")
-        self.accept()
+        self.mode_combo.currentIndexChanged.connect(self._refresh_summary)
+        self.process_name.textChanged.connect(self._refresh_summary)
+        self.proxy_port.valueChanged.connect(self._refresh_summary)
+        self._refresh_cert_status()
+        self._refresh_summary()
+        self.resize(600, 580)
+
+    def _refresh_cert_status(self) -> None:
+        installed = is_mitm_cert_installed()
+        path = mitm_cert_path()
+        if installed:
+            self.cert_status_label.setText(f"证书状态：已安装并受系统信任（{path.name}）")
+            self.cert_status_label.setStyleSheet("color: #34d399; font-weight: 700;")
+        else:
+            self.cert_status_label.setText(f"证书状态：尚未安装（首次使用请点击右侧按钮安装 {path.name}）")
+            self.cert_status_label.setStyleSheet("color: #fbbf24; font-weight: 700;")
+
+    def _refresh_summary(self) -> None:
+        port = int(self.proxy_port.value())
+        proc = self.process_name.text().strip() or DEFAULT_STEAM_PROCESS
+        mode = self.mode_combo.currentData()
+        if mode == "process":
+            header = (
+                f"【当前模式：OS 进程直连 (local:{proc})】\n"
+                "• 自动定向捕获 Steam 雀魂客户端进程流量，无需配置系统代理。\n"
+                f"• 若未授予管理员/网络扩展权限，将自动平滑回退至本地代理 127.0.0.1:{port}。\n\n"
+            )
+        else:
+            header = (
+                f"【当前模式：本地只读代理 (127.0.0.1:{port})】\n"
+                "• 免管理员权限，可通过以下任一方式将 Steam 雀魂流量导向本地只读代理：\n\n"
+            )
+        self.output.setPlainText(
+            header
+            + generate_surge_rules(proxy_port=port, process_name=proc, hook_port=HOOK_PORT)
+            + "\n"
+            + generate_clash_rules(proxy_port=port, process_name=proc)
+        )
+
+    def _scan_processes(self) -> None:
+        found = detect_steam_game_processes()
+        if not found:
+            self.output.setPlainText(
+                "未检测到正在运行的 Steam 雀魂客户端进程。\n"
+                "默认进程名保持为 Jantama_MahjongSoul（启动雀魂后会自动匹配）。"
+            )
+            return
+        first = found[0]
+        self.process_name.setText(str(first["spec"]))
+        lines = [f"检测到 {len(found)} 个雀魂相关进程："]
+        for item in found:
+            lines.append(f"• {item['name']} (PID {item['pid']}) -> 进程标识: {item['spec']}")
+        self.output.setPlainText("\n".join(lines))
+
+    def _install_cert(self) -> None:
+        ok, message = install_mitm_cert()
+        self._refresh_cert_status()
+        self.output.setPlainText(message)
+        if ok:
+            QMessageBox.information(self, "证书已就绪", message)
+        else:
+            QMessageBox.warning(self, "证书安装提示", message)
+
+    def _copy_pac_url(self) -> None:
+        url = f"http://127.0.0.1:{HOOK_PORT}/proxy.pac"
+        QApplication.clipboard().setText(url)
+        self.output.setPlainText(f"已复制系统 PAC 地址：{url}\n可在系统『代理设置 -> 使用设置脚本』中粘贴该地址。")
+
+    def _copy_steam_launch_arg(self) -> None:
+        arg = f"--proxy-server=http://127.0.0.1:{int(self.proxy_port.value())}"
+        QApplication.clipboard().setText(arg)
+        self.output.setPlainText(f"已复制 Steam 启动项：{arg}\n在 Steam 库右键『雀魂麻将』-> 属性 -> 通用 -> 启动选项 中粘贴即可。")
+
+    def _copy_clash_rules(self) -> None:
+        rules = generate_clash_rules(
+            proxy_port=int(self.proxy_port.value()),
+            process_name=self.process_name.text().strip() or DEFAULT_STEAM_PROCESS,
+        )
+        QApplication.clipboard().setText(rules)
+        self.output.setPlainText("已复制 Clash / Mihomo 分流规则到剪贴板：\n\n" + rules)
 
 
 class ConnectionSignals(QObject):
@@ -833,9 +853,9 @@ class ManualStateDialog(QDialog):
         update_player_fields()
         quick_layout.addLayout(form)
 
-        self.learn_and_resume = QCheckBox("用本次核对自动学习当前牌面，并恢复实时监测")
+        self.learn_and_resume = QCheckBox("应用本次手牌后继续保持实时协议监听")
         self.learn_and_resume.setChecked(True)
-        self.learn_and_resume.setToolTip("只在本机保存牌面小图模板，不保存完整截图")
+        self.learn_and_resume.setToolTip("后续收到雀魂协议事件时将自动更新实时牌面")
         quick_layout.addWidget(self.learn_and_resume)
         self.tabs.addTab(quick, "快速输入")
 

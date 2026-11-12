@@ -189,60 +189,99 @@ def shanten_text(s: int) -> str:
     return f"{s}向听"
 
 
-def discard_comparison(state: GameState) -> tuple[Candidate, ...]:
-    """Compare every distinct discard locally, without changing online candidate IDs."""
+# Display buckets for the relative danger heuristic, mirroring the five-band
+# color coding used by established mahjong assistants. A bucket is not a
+# calibrated deal-in probability, so the UI must never show it with decimals.
+DANGER_BANDS: tuple[tuple[int, str, str], ...] = (
+    (0, "安全", "safe"),
+    (1, "较安全", "low"),
+    (3, "注意", "watch"),
+    (4, "危险", "high"),
+    (6, "高危", "severe"),
+)
+
+
+def danger_level(bucket: int | None) -> tuple[str, str]:
+    """Map a relative danger bucket to (display label, semantic color key)."""
+    if bucket is None:
+        return "—", "unknown"
+    for ceiling, label, key in DANGER_BANDS:
+        if bucket <= ceiling:
+            return label, key
+    return DANGER_BANDS[-1][1], DANGER_BANDS[-1][2]
+
+
+def _validate_discard_state(state: GameState) -> None:
     state.validate()
     if state.observation_confidence < 0.90:
         raise UncertainState("识别置信度不足 0.90，请手动核对牌面")
     if len(state.hand) != 14 - 3 * state.open_melds:
         raise NoDecision("需要摸牌后的完整手牌才能比较切法，请先手动核对")
+
+
+@lru_cache(maxsize=256)
+def discard_candidate(state: GameState, tile: str) -> Candidate:
+    """Local analysis card for discarding one copy of `tile`.
+
+    Shared by the full comparison table and the single-tile hand simulation
+    so both surfaces always describe the same discard identically. Immutable
+    states and results allow bounded reuse; all observed fields key the cache.
+    """
+    _validate_discard_state(state)
+    rest = list(state.hand)
+    rest.remove(tile)
+    after = tuple(rest)
+    s = shanten(after, state.open_melds)
+    u, imp_tiles = ukeire_details(after, state)
+    d = danger(tile, state)
+    dora = dora_value(tile, state)
+
+    if imp_tiles:
+        preview_str = " ".join(imp_tiles[:6]) + (f" 等{len(imp_tiles)}种" if len(imp_tiles) > 6 else "")
+        wait_desc = f"{'待牌' if s == 0 else '进张'} {preview_str} 约 {u} 张"
+    else:
+        wait_desc = f"有效牌约 {u} 张"
+
+    s_desc = shanten_text(s)
+    if s == 0:
+        min_h, max_h, avg_score, tenpai_yaku = estimate_tenpai_value(state, after, imp_tiles)
+        expected_han = max_h
+        potential_yaku = tuple(tenpai_yaku)
+        if max_h > 0:
+            han_str = f"{min_h}番" if min_h == max_h else f"{min_h}~{max_h}番"
+            score_str = f"约 {avg_score} 点" if avg_score > 0 else ""
+            yaku_str = "、".join(tenpai_yaku[:3]) if tenpai_yaku else ""
+            val_desc = f"预计 {han_str}{(' (' + score_str + ')') if score_str else ''}{(' · ' + yaku_str) if yaku_str else ''}"
+        else:
+            val_desc = "形式听牌 (无役)"
+        yaku_summary = val_desc
+    else:
+        expected_han = None
+        potential = analyze_yaku_potential(state, after)
+        potential_yaku = tuple(potential[:4])
+        yaku_summary = "、".join(potential[:3]) if potential else yaku_hints(state)
+
+    return Candidate(
+        "discard", tile, f"打 {tile}",
+        f"{s_desc} · {wait_desc} · 危险级 {d} · 弃宝牌 {dora} 张 · {yaku_summary}",
+        s, u, d, dora,
+        improving_tiles=imp_tiles,
+        potential_yaku=potential_yaku,
+        expected_han=expected_han,
+    )
+
+
+@lru_cache(maxsize=32)
+def discard_comparison(state: GameState) -> tuple[Candidate, ...]:
+    """Compare every distinct discard locally, without changing online candidate IDs."""
+    _validate_discard_state(state)
     seen: set[str] = set()
     scored: list[Candidate] = []
     for tile in state.hand:
         if tile in seen:
             continue
         seen.add(tile)
-        rest = list(state.hand)
-        rest.remove(tile)
-        after = tuple(rest)
-        s = shanten(after, state.open_melds)
-        u, imp_tiles = ukeire_details(after, state)
-        d = danger(tile, state)
-        dora = dora_value(tile, state)
-
-        if imp_tiles:
-            preview_str = " ".join(imp_tiles[:6]) + (f" 等{len(imp_tiles)}种" if len(imp_tiles) > 6 else "")
-            wait_desc = f"{'待牌' if s == 0 else '进张'} {preview_str} 约 {u} 张"
-        else:
-            wait_desc = f"有效牌约 {u} 张"
-
-        s_desc = shanten_text(s)
-        if s == 0:
-            min_h, max_h, avg_score, tenpai_yaku = estimate_tenpai_value(state, after, imp_tiles)
-            expected_han = max_h
-            potential_yaku = tuple(tenpai_yaku)
-            if max_h > 0:
-                han_str = f"{min_h}番" if min_h == max_h else f"{min_h}~{max_h}番"
-                score_str = f"约 {avg_score} 点" if avg_score > 0 else ""
-                yaku_str = "、".join(tenpai_yaku[:3]) if tenpai_yaku else ""
-                val_desc = f"预计 {han_str}{(' (' + score_str + ')') if score_str else ''}{(' · ' + yaku_str) if yaku_str else ''}"
-            else:
-                val_desc = "形式听牌 (无役)"
-            yaku_summary = val_desc
-        else:
-            expected_han = None
-            potential = analyze_yaku_potential(state, after)
-            potential_yaku = tuple(potential[:4])
-            yaku_summary = "、".join(potential[:3]) if potential else yaku_hints(state)
-
-        scored.append(Candidate(
-            "discard", tile, f"打 {tile}",
-            f"{s_desc} · {wait_desc} · 危险级 {d} · 弃宝牌 {dora} 张 · {yaku_summary}",
-            s, u, d, dora,
-            improving_tiles=imp_tiles,
-            potential_yaku=potential_yaku,
-            expected_han=expected_han,
-        ))
+        scored.append(discard_candidate(state, tile))
     threatened = any(state.riichi[i] for i in range(state.player_count) if i != state.seat)
     if threatened:
         scored.sort(key=lambda c: (c.danger, c.shanten, -c.ukeire, c.dora_loss, index(c.tile)))

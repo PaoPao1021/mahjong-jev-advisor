@@ -10,7 +10,6 @@ def isolate_user_configuration(tmp_path, monkeypatch):
     monkeypatch.delenv("MAHJONG_ADVISOR_EDITION", raising=False)
     monkeypatch.setenv("MAHJONG_ADVISOR_CONFIG_DIR", str(tmp_path))
     monkeypatch.setattr("mahjong_jev_advisor.settings.config_dir", lambda: tmp_path)
-    monkeypatch.setattr("mahjong_jev_advisor.vision.config_dir", lambda: tmp_path)
     monkeypatch.delenv("AI_GATEWAY_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)

@@ -5,15 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mahjong-jev-advisor"
 version = "0.2.0"
-description = "Read-only Mahjong Soul screen advisor with Jev via Vercel AI Gateway"
+description = "Read-only Mahjong Soul real-time protocol advisor for Steam and Web with Jev"
 requires-python = ">=3.12"
 dependencies = [
   "PySide6>=6.8,<7",
-  "opencv-python-headless>=4.10,<5",
-  "numpy>=1.26,<3",
-  "mss>=10,<11",
-  "rapidocr-onnxruntime>=1.4,<2",
   "mahjong>=1.2.1,<2",
+  "mitmproxy>=11,<13",
 ]
 
 [project.optional-dependencies]

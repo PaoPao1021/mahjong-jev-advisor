@@ -10,7 +10,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 ".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)"
 if errorlevel 1 goto fail
-".venv\Scripts\python.exe" -c "import mahjong_jev_advisor, PySide6.QtWidgets, cv2, mss, rapidocr_onnxruntime, mahjong"
+".venv\Scripts\python.exe" -c "import mahjong_jev_advisor, PySide6.QtWidgets, mitmproxy, mahjong"
 if errorlevel 1 (
   ".venv\Scripts\python.exe" -m pip install -e .
   if errorlevel 1 goto fail
